@@ -1,0 +1,244 @@
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      classes: [
+            '草地', '乔木林', '道路', '灌木林', '不透水面', 
+            '独立建筑', '裸地', '水域', '旱地', '墓地',
+            '体育场', '建筑工地', '桥梁', '其他林地', '广场',
+            '疏林', '园地', '铁路', '密集建筑区', '水田',
+            '农业大棚', '机场', '尾矿库', '露天采矿场', '露天采石场',
+            '大坝（可发电）', '大坝（不可发电）', '沙漠', '冰川', '云','停车场','工矿用地','太阳能板','背景'
+        ]
+      ignore_bg: true
+      palette:  [
+            [124, 252, 0],    # 草地
+            [0, 92, 0],       # 乔木林
+            [92, 0, 92],      # 道路
+            [154, 205, 50],   # 灌木林
+            [139, 0, 0],      # 不透水面
+            [0, 0, 184],      # 独立建筑
+            [244, 164, 96],   # 裸地
+            [69, 0, 0],       # 水域
+            [210, 180, 140],  # 旱地
+            [169, 169, 169],  # 墓地
+            [99, 50, 50],     # 体育场
+            [255, 99, 71],    # 建筑工地
+            [0, 46, 0],       # 桥梁
+            [34, 139, 34],    # 其他林地
+            [255, 215, 0],    # 广场
+            [107, 142, 35],   # 疏林
+            [0, 128, 128],    # 园地
+            [128, 0, 255],    # 铁路
+            [0, 0, 128],      # 密集建筑区
+            [30, 144, 255],   # 水田
+            [255, 182, 193],  # 农业大棚
+            [128, 128, 128],  # 机场
+            [219, 112, 147],  # 尾矿库
+            [160, 82, 45],    # 露天采矿场
+            [139, 69, 19],    # 露天采石场
+            [0, 206, 209],    # 大坝（可发电）
+            [72, 209, 204],   # 大坝（不可发电）
+            [238, 232, 170],  # 沙漠
+            [230, 230, 250],  # 冰川
+            [245, 245, 245] ,  # 云
+            [192, 192, 192], #停车场
+            [0,92,245], # 工矿用地
+            [33,33,33], # 太阳能板
+            [0,0,0]
+        ]
+      root_path_1: /public/home/daiwenxuan/project/fan/data/dataset/merge_data_xingtu_spilt/train/images
+      root_path_2: /public/home/daiwenxuan/project/fan/data/dataset/merge_data_xingtu_spilt/train/labels
+      cache: none
+      split_key: train
+  wrapper:
+    name: train
+    args:
+      inp_size: 1024
+      augment: false
+  batch_size: 3
+
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      classes: [
+            '草地', '乔木林', '道路', '灌木林', '不透水面', 
+            '独立建筑', '裸地', '水域', '旱地', '墓地',
+            '体育场', '建筑工地', '桥梁', '其他林地', '广场',
+            '疏林', '园地', '铁路', '密集建筑区', '水田',
+            '农业大棚', '机场', '尾矿库', '露天采矿场', '露天采石场',
+            '大坝（可发电）', '大坝（不可发电）', '沙漠', '冰川', '云','停车场','工矿用地','太阳能板','背景'
+      ]
+      ignore_bg: true
+      palette:  [
+            [124, 252, 0],    # 草地
+            [0, 92, 0],       # 乔木林
+            [92, 0, 92],      # 道路
+            [154, 205, 50],   # 灌木林
+            [139, 0, 0],      # 不透水面
+            [0, 0, 184],      # 独立建筑
+            [244, 164, 96],   # 裸地
+            [69, 0, 0],       # 水域
+            [210, 180, 140],  # 旱地
+            [169, 169, 169],  # 墓地
+            [99, 50, 50],     # 体育场
+            [255, 99, 71],    # 建筑工地
+            [0, 46, 0],       # 桥梁
+            [34, 139, 34],    # 其他林地
+            [255, 215, 0],    # 广场
+            [107, 142, 35],   # 疏林
+            [0, 128, 128],    # 园地
+            [128, 0, 255],    # 铁路
+            [0, 0, 128],      # 密集建筑区
+            [30, 144, 255],   # 水田
+            [255, 182, 193],  # 农业大棚
+            [128, 128, 128],  # 机场
+            [219, 112, 147],  # 尾矿库
+            [160, 82, 45],    # 露天采矿场
+            [139, 69, 19],    # 露天采石场
+            [0, 206, 209],    # 大坝（可发电）
+            [72, 209, 204],   # 大坝（不可发电）
+            [238, 232, 170],  # 沙漠
+            [230, 230, 250],  # 冰川
+            [245, 245, 245] ,  # 云
+            [192, 192, 192], #停车场
+            [0,92,245], # 工矿用地
+            [33,33,33], # 太阳能板
+            [0,0,0]
+        ]
+      root_path_1: /public/home/daiwenxuan/project/fan/data/dataset/merge_data_xingtu_spilt/val/images
+      root_path_2: /public/home/daiwenxuan/project/fan/data/dataset/merge_data_xingtu_spilt/val/labels
+      cache: none
+      split_key: test
+  wrapper:
+    name: val
+    args:
+      inp_size: 1024
+  batch_size: 1
+
+test_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      classes: [
+            '草地', '乔木林', '道路', '灌木林', '不透水面', 
+            '独立建筑', '裸地', '水域', '旱地', '墓地',
+            '体育场', '建筑工地', '桥梁', '其他林地', '广场',
+            '疏林', '园地', '铁路', '密集建筑区', '水田',
+            '农业大棚', '机场', '尾矿库', '露天采矿场', '露天采石场',
+            '大坝（可发电）', '大坝（不可发电）', '沙漠', '冰川', '云','停车场','工矿用地','太阳能板','背景'
+        ]
+      ignore_bg: true
+      palette:  [
+            [124, 252, 0],    # 草地
+            [0, 92, 0],       # 乔木林
+            [92, 0, 92],      # 道路
+            [154, 205, 50],   # 灌木林
+            [139, 0, 0],      # 不透水面
+            [0, 0, 184],      # 独立建筑
+            [244, 164, 96],   # 裸地
+            [69, 0, 0],       # 水域
+            [210, 180, 140],  # 旱地
+            [169, 169, 169],  # 墓地
+            [99, 50, 50],     # 体育场
+            [255, 99, 71],    # 建筑工地
+            [0, 46, 0],       # 桥梁
+            [34, 139, 34],    # 其他林地
+            [255, 215, 0],    # 广场
+            [107, 142, 35],   # 疏林
+            [0, 128, 128],    # 园地
+            [128, 0, 255],    # 铁路
+            [0, 0, 128],      # 密集建筑区
+            [30, 144, 255],   # 水田
+            [255, 182, 193],  # 农业大棚
+            [128, 128, 128],  # 机场
+            [219, 112, 147],  # 尾矿库
+            [160, 82, 45],    # 露天采矿场
+            [139, 69, 19],    # 露天采石场
+            [0, 206, 209],    # 大坝（可发电）
+            [72, 209, 204],   # 大坝（不可发电）
+            [238, 232, 170],  # 沙漠
+            [230, 230, 250],  # 冰川
+            [245, 245, 245] ,  # 云
+            [192, 192, 192], #停车场
+            [0,92,245], # 工矿用地
+            [33,33,33], # 太阳能板
+            [0,0,0]
+        ]
+      root_path_1: /public/home/daiwenxuan/project/fan/data/dataset/merge_data_1116/val/images
+      root_path_2: /public/home/daiwenxuan/project/fan/data/dataset/merge_data_1116/val/images
+      cache: none
+      split_key: test
+  wrapper:
+    name: test
+    args:
+      inp_size: 1024
+  batch_size: 1
+
+eval_type: seg
+sam_checkpoint: /public/home/daiwenxuan/project/pretrained_weights/sam_vit_h_4b8939.pth
+data_norm:
+  inp:
+    sub:
+    - 0.5
+    div:
+    - 0.5
+  gt:
+    sub:
+    - 0.5
+    div:
+    - 0.5
+  gt_rgb:
+    sub:
+    - 0.5
+    div:
+    - 0.5
+model:
+  name: sam_h
+  args:
+    num_classes: 34
+    inp_size: 1024
+    loss: iou
+    loss_weight : [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 ,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,1.0,1.0,1.0,1.0]
+    encoder_mode:
+      name: sam
+      img_size: 1024
+      mlp_ratio: 4
+      patch_size: 16
+      qkv_bias: true
+      use_rel_pos: true
+      window_size: 14
+      out_chans: 256
+      scale_factor: 32
+      input_type: fft
+      freq_nums: 0.25
+      prompt_type: highpass
+      prompt_embed_dim: 256
+      tuning_stage: 1234
+      handcrafted_tune: true
+      embedding_tune: true
+      adaptor: adaptor
+      embed_dim: 1280
+      depth: 32
+      num_heads: 16
+      global_attn_indexes:
+      - 7
+      - 15
+      - 23
+      - 31
+optimizer:
+  name: adamw
+  args:
+    lr: 0.0002
+lr_min: 1.0e-7
+epoch_max: 90
+
+multi_step_lr:
+  milestones:
+  - 1
+  gamma: 0.1
+epoch_val: 2
+epoch_save: 1
+resume: 36
+work_dir: /public/home/daiwenxuan/project/fan/cwsam/save/merge_data_test
