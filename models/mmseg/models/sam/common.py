@@ -110,6 +110,129 @@ class MoEMLPBlock(nn.Module):
                     
         return final_output.reshape(x.shape)
 
+class HierarchicalMoEMLPBlock(nn.Module):
+    """
+    分层MoE结构：
+    - 第一级Router：将token分发到不同的专家组
+    - 第二级Router：在选定的专家组内选择具体的专家
+    """
+    def __init__(
+        self,
+        embedding_dim: int,
+        mlp_dim: int,
+        act: Type[nn.Module] = nn.GELU,
+        num_expert_groups: int = 6,    # 专家组数量
+        experts_per_group: int = 16,   # 每组内的专家数量
+        k_groups: int = 2,             # 选择的专家组数量
+        k_experts: int = 4,            # 每组内选择的专家数量  
+        noisy_gating: bool = True,     # 是否使用噪声门控
+    ) -> None:
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.mlp_dim = mlp_dim
+        self.num_expert_groups = num_expert_groups
+        self.experts_per_group = experts_per_group
+        self.k_groups = k_groups
+        self.k_experts = k_experts
+        self.noisy_gating = noisy_gating
+        
+        # 第一级门控：选择专家组
+        self.group_gate = nn.Linear(embedding_dim, num_expert_groups)
+        
+        # 专家组：每组包含多个专家
+        self.expert_groups = nn.ModuleList()
+        self.expert_gates = nn.ModuleList()  # 分离门控网络
+        
+        for group_idx in range(num_expert_groups):
+            # 专家网络
+            experts = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(embedding_dim, mlp_dim),
+                    act(),
+                    nn.Linear(mlp_dim, embedding_dim)
+                ) for _ in range(experts_per_group)
+            ])
+            self.expert_groups.append(experts)
+            
+            # 组内门控网络
+            gate = nn.Linear(embedding_dim, experts_per_group)
+            self.expert_gates.append(gate)
+        
+        if self.noisy_gating:
+            self.noise_epsilon = 1e-2
+    
+    def _noisy_top_k_gating(self, x, gate, k):
+        """带噪音的Top-K门控机制"""
+        clean_logits = gate(x)
+        
+        if self.noisy_gating and self.training:
+            noise = torch.randn_like(clean_logits) * self.noise_epsilon
+            logits = clean_logits + noise
+        else:
+            logits = clean_logits
+            
+        # 计算top-k门控权重
+        top_k_logits, top_k_indices = logits.topk(min(k, logits.size(-1)), dim=-1)
+        top_k_gates = F.softmax(top_k_logits, dim=-1)
+        
+        return top_k_gates, top_k_indices
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        original_shape = x.shape
+        x_flat = x.reshape(-1, self.embedding_dim)
+        batch_size = x_flat.shape[0]
+        
+        # 第一级路由：选择专家组
+        group_gates, group_indices = self._noisy_top_k_gating(
+            x_flat, self.group_gate, self.k_groups
+        )
+        
+        final_output = torch.zeros_like(x_flat)
+        
+        # 对每个选中的专家组进行处理
+        for group_k_idx in range(self.k_groups):
+            # 找出使用当前专家组的token
+            group_mask = torch.arange(batch_size, device=x_flat.device).unsqueeze(1) == \
+                        torch.arange(batch_size, device=x_flat.device).unsqueeze(0)
+            group_mask = group_mask[:, 0]  # 简化为所有token都考虑所有组
+            
+            # 获取每个token对应的专家组
+            for token_idx in range(batch_size):
+                selected_group_idx = group_indices[token_idx, group_k_idx].item()
+                group_weight = group_gates[token_idx, group_k_idx]
+                
+                if group_weight < 1e-6:  # 跳过权重过小的
+                    continue
+                
+                # 获取选定的专家组和门控
+                selected_experts = self.expert_groups[selected_group_idx]
+                selected_gate = self.expert_gates[selected_group_idx]
+                
+                # 第二级路由：在组内选择专家
+                token_input = x_flat[token_idx:token_idx+1]  # [1, embedding_dim]
+                expert_gates, expert_indices = self._noisy_top_k_gating(
+                    token_input, selected_gate, self.k_experts
+                )
+                
+                # 在选定组内处理专家
+                group_output = torch.zeros_like(token_input)
+                for expert_k_idx in range(self.k_experts):
+                    expert_idx = expert_indices[0, expert_k_idx].item()
+                    expert_weight = expert_gates[0, expert_k_idx]
+                    
+                    if expert_weight < 1e-6:
+                        continue
+                    
+                    # 通过选定的专家
+                    selected_expert = selected_experts[expert_idx]
+                    expert_output = selected_expert(token_input)
+                    group_output += expert_weight * expert_output
+                
+                # 累加到最终输出，应用组权重
+                final_output[token_idx:token_idx+1] += group_weight * group_output
+        
+        return final_output.reshape(original_shape)
+
 class Adapter(nn.Module):
     def __init__(self, D_features, mlp_ratio=0.25, act_layer=nn.GELU, skip_connect=True):
         super().__init__()

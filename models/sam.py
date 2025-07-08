@@ -8,34 +8,22 @@ import torch.nn.functional as F
 import timm
 import math
 from models import register
-from torchvision.models import vit_b_16, vit_l_16
-from .vit_modified import vit_h_14
+
 
 # from transformers import ViTModel
 from .mmseg.models.sam import (
-    ImageEncoderViT,
     MaskDecoder,
-    MaskDecoderOnlyCls,
-    TwoWayTransformer,
-    ImageEncoderViT_vitadp,
-    ImageEncoderViT_tinyadp,
-    ImageEncoderViT_vitadp_b2b,
-    ImageEncoderViT_vitlora,
-    ImageEncoderViT_vitlora_mix_adapter,
-    ImageEncoderViT_tiny_lora_mix_adapter,
-    ImageEncoderViT_vit_GAM,
     MaskDecoder_moe,
     TwoWayTransformer_moe,
-    ImageEncoderViT_moe,
-    ImageEncoderViT_moe_layer,
-    ImageEncoderViT_soft_moe
+
+    # ImageEncoderViT_moe_layer,
+
+    ImageEncoderViT_hierarchical_moe
 )
 
 logger = logging.getLogger(__name__)
 from .iou_loss import IOU
 from typing import Any, Optional, Tuple
-from .deeplabv3plus import DeepLab
-from .swin_transformerv2 import SwinTransformerV2
 
 
 def onehot_to_mask(mask, palette):
@@ -53,14 +41,17 @@ def onehot_to_mask(mask, palette):
 def init_weights(layer):
     if type(layer) == nn.Conv2d:
         nn.init.normal_(layer.weight, mean=0.0, std=0.02)
-        nn.init.constant_(layer.bias, 0.0)
+        if layer.bias is not None:
+            nn.init.constant_(layer.bias, 0.0)
     elif type(layer) == nn.Linear:
         nn.init.normal_(layer.weight, mean=0.0, std=0.02)
-        nn.init.constant_(layer.bias, 0.0)
+        if layer.bias is not None:
+            nn.init.constant_(layer.bias, 0.0)
     elif type(layer) == nn.BatchNorm2d:
         # print(layer)
         nn.init.normal_(layer.weight, mean=1.0, std=0.02)
-        nn.init.constant_(layer.bias, 0.0)
+        if layer.bias is not None:
+            nn.init.constant_(layer.bias, 0.0)
 
 
 class BBCEWithLogitLoss(nn.Module):
@@ -129,8 +120,262 @@ class PositionEmbeddingRandom(nn.Module):
         pe = self._pe_encoding(torch.stack([x_embed, y_embed], dim=-1))
         return pe.permute(2, 0, 1)  # C x H x W
 
-@register('sam_moe_3b')
-class SAM_MOE_3B(nn.Module):
+# @register('sam_moe_3b')
+# class SAM_MOE_3B(nn.Module):
+#     def __init__(
+#         self,
+#         inp_size=None,
+#         encoder_mode=None,
+#         loss=None,
+#         num_classes=None,
+#         loss_weight=None,
+#         ignore_index=-100,
+#     ):
+#         super().__init__()
+#         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#         self.embed_dim = encoder_mode['embed_dim']
+#         self.image_encoder = ImageEncoderViT_moe_layer(
+#             img_size=inp_size,
+#             patch_size=encoder_mode['patch_size'],
+#             in_chans=3,
+#             embed_dim=encoder_mode['embed_dim'],
+#             depth=encoder_mode['depth'],
+#             num_heads=encoder_mode['num_heads'],
+#             mlp_ratio=encoder_mode['mlp_ratio'],
+#             out_chans=encoder_mode['out_chans'],
+#             qkv_bias=encoder_mode['qkv_bias'],
+#             norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+#             act_layer=nn.GELU,
+#             use_rel_pos=encoder_mode['use_rel_pos'],
+#             rel_pos_zero_init=True,
+#             window_size=encoder_mode['window_size'],
+#             global_attn_indexes=encoder_mode['global_attn_indexes'],
+#             moe_num_experts=16,
+#             moe_k=4,
+#             moe_noisy_gating=True,
+#             moe_start_layer_index=28
+#         )
+#         self.prompt_embed_dim = encoder_mode['prompt_embed_dim']
+#         self.mask_decoder = MaskDecoder(
+#             num_multimask_outputs=3,
+#             transformer=TwoWayTransformer_moe(
+#                 depth=2,
+#                 embedding_dim=self.prompt_embed_dim,
+#                 mlp_dim=2048,
+#                 num_heads=8,
+#             ),
+#             transformer_dim=self.prompt_embed_dim,
+#             iou_head_depth=3,
+#             iou_head_hidden_dim=256,
+#             num_classes=num_classes,
+#         )
+
+#         if 'evp' in encoder_mode['name']:
+#             for k, p in self.encoder.named_parameters():
+#                 if (
+#                     "prompt" not in k
+#                     and "mask_decoder" not in k
+#                     and "prompt_encoder" not in k
+#                 ):
+#                     p.requires_grad = False
+
+#         self.loss_mode = loss
+#         self.ignore_index = ignore_index
+
+#         if self.loss_mode == 'bce':
+#             self.criterionBCE = torch.nn.BCEWithLogitsLoss(reduction='none')
+
+#         elif self.loss_mode == 'bbce':
+#             self.criterionBCE = BBCEWithLogitLoss(reduction='none')
+
+#         elif self.loss_mode == 'iou':
+#             # self.criterionBCE = torch.nn.BCEWithLogitsLoss()
+#             # pos_weight = torch.tensor([1.5, 1, 0.5, 1.9, 0.1], dtype=torch.float)
+#             if loss_weight is not None:
+#                 pos_weight = torch.tensor(loss_weight, dtype=torch.float)
+#                 self.criterionBCE = torch.nn.CrossEntropyLoss(
+#                     pos_weight, ignore_index=self.ignore_index
+#                 )
+#             else:
+#                 self.criterionBCE = torch.nn.CrossEntropyLoss(
+#                     ignore_index=self.ignore_index
+#                 )
+
+#             self.criterionIOU = IOU()
+
+#         # elif self.loss_mode == 'iou_ce':
+#         #     self.criterionBCE =  torch.nn.CrossEntropyLoss()
+#         #     self.criterionIOU = IOU()
+
+#         self.pe_layer = PositionEmbeddingRandom(encoder_mode['prompt_embed_dim'] // 2)
+#         self.inp_size = inp_size
+#         self.image_embedding_size = inp_size // encoder_mode['patch_size']
+#         self.no_mask_embed = nn.Embedding(1, encoder_mode['prompt_embed_dim'])
+
+#     def set_input(self, input, gt_mask):
+#         self.input = input.to(self.device)
+#         self.gt_mask = gt_mask.to(self.device)
+
+#     def get_dense_pe(self) -> torch.Tensor:
+#         """
+#         Returns the positional encoding used to encode point prompts,
+#         applied to a dense set of points the shape of the image encoding.
+
+#         Returns:
+#           torch.Tensor: Positional encoding with shape
+#             1x(embed_dim)x(embedding_h)x(embedding_w)
+#         """
+#         return self.pe_layer(self.image_embedding_size).unsqueeze(0)
+
+#     def forward(self):
+#         # bs = 1
+#         bs = self.input.shape[0]
+
+#         # Embed prompts
+#         sparse_embeddings = torch.empty(
+#             (bs, 0, self.prompt_embed_dim), device=self.input.device
+#         )
+#         dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+#             bs, -1, self.image_embedding_size, self.image_embedding_size
+#         )
+
+#         self.features = self.image_encoder(self.input)
+
+#         # Predict masks
+#         low_res_masks, iou_predictions = self.mask_decoder(
+#             image_embeddings=self.features,
+#             image_pe=self.get_dense_pe(),
+#             sparse_prompt_embeddings=sparse_embeddings,
+#             dense_prompt_embeddings=dense_embeddings,
+#             multimask_output=False,
+#         )
+
+#         # Upscale the masks to the original image resolution
+#         masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
+#         self.pred_mask = masks
+
+#     def infer(self, input):
+#         bs = 1
+
+#         # Embed prompts
+#         sparse_embeddings = torch.empty(
+#             (bs, 0, self.prompt_embed_dim), device=input.device
+#         )
+#         dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+#             bs, -1, self.image_embedding_size, self.image_embedding_size
+#         )
+
+#         self.features = self.image_encoder(input)  # 第一个val 第二张图推理循环 显存+5G
+
+#         # Predict masks
+#         low_res_masks, iou_predictions = self.mask_decoder(
+#             image_embeddings=self.features,
+#             image_pe=self.get_dense_pe(),
+#             sparse_prompt_embeddings=sparse_embeddings,
+#             dense_prompt_embeddings=dense_embeddings,
+#             multimask_output=False,
+#         )
+
+#         # Upscale the masks to the original image resolution
+#         masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
+#         # masks_rgb= onehot_to_mask(masks)
+#         return masks
+
+#     def postprocess_masks(
+#         self,
+#         masks: torch.Tensor,
+#         input_size: Tuple[int, ...],
+#         original_size: Tuple[int, ...],
+#     ) -> torch.Tensor:
+#         """
+#         Remove padding and upscale masks to the original image size.
+
+#         Arguments:
+#           masks (torch.Tensor): Batched masks from the mask_decoder,
+#             in BxCxHxW format.
+#           input_size (tuple(int, int)): The size of the image input to the
+#             model, in (H, W) format. Used to remove padding.
+#           original_size (tuple(int, int)): The original size of the image
+#             before resizing for input to the model, in (H, W) format.
+
+#         Returns:
+#           (torch.Tensor): Batched masks in BxCxHxW format, where (H, W)
+#             is given by original_size.
+#         """
+#         # masks = masks[0]
+#         masks = masks.squeeze(dim=1)
+#         masks = F.interpolate(
+#             masks,
+#             (self.image_encoder.img_size, self.image_encoder.img_size),
+#             mode="bilinear",
+#             align_corners=False,
+#         )
+#         masks = masks[..., :input_size, :input_size]
+#         masks = F.interpolate(
+#             masks, original_size, mode="bilinear", align_corners=False
+#         )
+#         return masks
+
+#     def get_ignore_mask_loss(self, loss, ignore_index: list = None):
+#         """Create a mask to ignore certain pixels in the ground truth."""
+#         # 创建一个掩码
+#         mask = torch.ones_like(loss, device=loss.device)
+
+#         # 对于每个要屏蔽的类别，将掩码设置为0
+#         for index in ignore_index:
+#             mask[torch.argmax(self.gt_mask, dim=1) == index] = 0
+
+#         # 应用掩码到损失上
+#         loss = loss * mask
+#         return loss.sum() / torch.ones_like(loss, device=loss.device).sum()
+
+#     def backward_G(self):
+#         """Calculate GAN and L1 loss for the generator"""
+#         # mask = self.create_ignore_mask(self.gt_mask, ignore_index=self.ignore_index)
+
+#         loss = self.criterionBCE(
+#             self.pred_mask, torch.argmax(self.gt_mask, dim=1, keepdim=True).squeeze(1)
+#         )  # (1,4,1024,1024)
+#         # print(
+#         #     f'未忽略类别loss:{self.criterionBCE(self.pred_mask, self.gt_mask).mean()}'
+#         # )
+#         # guanfang_crt = torch.nn.CrossEntropyLoss(ignore_index=0)
+#         # guanfang_loss = guanfang_crt(
+#         #     self.pred_mask, torch.argmax(self.gt_mask, dim=1, keepdim=True).squeeze(1)
+#         # )
+#         # print(f'guanfang忽略类别loss:{guanfang_loss}')
+#         # loss = self.get_ignore_mask_loss(loss, ignore_index=self.ignore_index)
+#         # print(f'忽略类别loss:{loss}')
+
+#         # loss = loss * mask  # 应用掩码
+#         # loss = loss.sum() / mask.sum()  # 仅计算非忽略像素的损失
+#         self.loss_G = loss
+#         # if self.loss_mode == 'iou':
+#         # self.loss_G += _iou_loss(self.pred_mask, self.gt_mask)
+
+#         self.loss_G.backward()
+
+#     def optimize_parameters(self):
+#         self.forward()
+#         self.optimizer.zero_grad()  # set G's gradients to zero
+#         self.backward_G()  # calculate graidents for G
+#         self.optimizer.step()  # udpate G's weights
+
+#     def set_requires_grad(self, nets, requires_grad=False):
+#         """Set requies_grad=Fasle for all the networks to avoid unnecessary computations
+#         Parameters:
+#             nets (network list)   -- a list of networks
+#             requires_grad (bool)  -- whether the networks require gradients or not
+#         """
+#         if not isinstance(nets, list):
+#             nets = [nets]
+#         for net in nets:
+#             if net is not None:
+#                 for param in net.parameters():
+#                     param.requires_grad = requires_grad
+
+@register('sam_hierarchical_moe_10b')
+class SAM_HIERARCHICAL_MOE_10B(nn.Module):
     def __init__(
         self,
         inp_size=None,
@@ -143,12 +388,14 @@ class SAM_MOE_3B(nn.Module):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.embed_dim = encoder_mode['embed_dim']
-        self.image_encoder = ImageEncoderViT_moe_layer(
+        
+        # 使用分层MoE图像编码器
+        self.image_encoder = ImageEncoderViT_hierarchical_moe(
             img_size=inp_size,
             patch_size=encoder_mode['patch_size'],
             in_chans=3,
             embed_dim=encoder_mode['embed_dim'],
-            depth=encoder_mode['depth'],
+            depth=encoder_mode['depth'],  # 40层 (垂直扩展)
             num_heads=encoder_mode['num_heads'],
             mlp_ratio=encoder_mode['mlp_ratio'],
             out_chans=encoder_mode['out_chans'],
@@ -159,13 +406,19 @@ class SAM_MOE_3B(nn.Module):
             rel_pos_zero_init=True,
             window_size=encoder_mode['window_size'],
             global_attn_indexes=encoder_mode['global_attn_indexes'],
-            moe_num_experts=16,
-            moe_k=4,
-            moe_noisy_gating=True,
-            moe_start_layer_index=28
+            # 分层MoE参数 (水平扩展: 6组 × 16专家 = 96专家)
+            moe_num_expert_groups=encoder_mode.get('moe_num_expert_groups', 6),
+            moe_experts_per_group=encoder_mode.get('moe_experts_per_group', 16),
+            moe_k_groups=encoder_mode.get('moe_k_groups', 2),
+            moe_k_experts=encoder_mode.get('moe_k_experts', 4),
+            moe_noisy_gating=encoder_mode.get('moe_noisy_gating', True),
+            moe_start_layer_index=encoder_mode.get('moe_start_layer_index', 24)
         )
+        
         self.prompt_embed_dim = encoder_mode['prompt_embed_dim']
-        self.mask_decoder = MaskDecoder(
+        
+        # 使用MoE的Mask Decoder
+        self.mask_decoder = MaskDecoder_moe(
             num_multimask_outputs=3,
             transformer=TwoWayTransformer_moe(
                 depth=2,
@@ -195,11 +448,9 @@ class SAM_MOE_3B(nn.Module):
             self.criterionBCE = torch.nn.BCEWithLogitsLoss(reduction='none')
 
         elif self.loss_mode == 'bbce':
-            self.criterionBCE = BBCEWithLogitLoss(reduction='none')
+            self.criterionBCE = BBCEWithLogitLoss()
 
         elif self.loss_mode == 'iou':
-            # self.criterionBCE = torch.nn.BCEWithLogitsLoss()
-            # pos_weight = torch.tensor([1.5, 1, 0.5, 1.9, 0.1], dtype=torch.float)
             if loss_weight is not None:
                 pos_weight = torch.tensor(loss_weight, dtype=torch.float)
                 self.criterionBCE = torch.nn.CrossEntropyLoss(
@@ -211,10 +462,6 @@ class SAM_MOE_3B(nn.Module):
                 )
 
             self.criterionIOU = IOU()
-
-        # elif self.loss_mode == 'iou_ce':
-        #     self.criterionBCE =  torch.nn.CrossEntropyLoss()
-        #     self.criterionIOU = IOU()
 
         self.pe_layer = PositionEmbeddingRandom(encoder_mode['prompt_embed_dim'] // 2)
         self.inp_size = inp_size
@@ -237,7 +484,6 @@ class SAM_MOE_3B(nn.Module):
         return self.pe_layer(self.image_embedding_size).unsqueeze(0)
 
     def forward(self):
-        # bs = 1
         bs = self.input.shape[0]
 
         # Embed prompts
@@ -264,7 +510,7 @@ class SAM_MOE_3B(nn.Module):
         self.pred_mask = masks
 
     def infer(self, input):
-        bs = 1
+        bs = input.shape[0]
 
         # Embed prompts
         sparse_embeddings = torch.empty(
@@ -274,7 +520,7 @@ class SAM_MOE_3B(nn.Module):
             bs, -1, self.image_embedding_size, self.image_embedding_size
         )
 
-        self.features = self.image_encoder(input)  # 第一个val 第二张图推理循环 显存+5G
+        self.features = self.image_encoder(input)
 
         # Predict masks
         low_res_masks, iou_predictions = self.mask_decoder(
@@ -287,7 +533,6 @@ class SAM_MOE_3B(nn.Module):
 
         # Upscale the masks to the original image resolution
         masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
-        # masks_rgb= onehot_to_mask(masks)
         return masks
 
     def postprocess_masks(
@@ -311,7 +556,6 @@ class SAM_MOE_3B(nn.Module):
           (torch.Tensor): Batched masks in BxCxHxW format, where (H, W)
             is given by original_size.
         """
-        # masks = masks[0]
         masks = masks.squeeze(dim=1)
         masks = F.interpolate(
             masks,
@@ -327,48 +571,28 @@ class SAM_MOE_3B(nn.Module):
 
     def get_ignore_mask_loss(self, loss, ignore_index: list = None):
         """Create a mask to ignore certain pixels in the ground truth."""
-        # 创建一个掩码
         mask = torch.ones_like(loss, device=loss.device)
 
-        # 对于每个要屏蔽的类别，将掩码设置为0
-        for index in ignore_index:
-            mask[torch.argmax(self.gt_mask, dim=1) == index] = 0
+        if ignore_index is not None:
+            for index in ignore_index:
+                mask[torch.argmax(self.gt_mask, dim=1) == index] = 0
 
-        # 应用掩码到损失上
         loss = loss * mask
         return loss.sum() / torch.ones_like(loss, device=loss.device).sum()
 
     def backward_G(self):
         """Calculate GAN and L1 loss for the generator"""
-        # mask = self.create_ignore_mask(self.gt_mask, ignore_index=self.ignore_index)
-
         loss = self.criterionBCE(
             self.pred_mask, torch.argmax(self.gt_mask, dim=1, keepdim=True).squeeze(1)
-        )  # (1,4,1024,1024)
-        # print(
-        #     f'未忽略类别loss:{self.criterionBCE(self.pred_mask, self.gt_mask).mean()}'
-        # )
-        # guanfang_crt = torch.nn.CrossEntropyLoss(ignore_index=0)
-        # guanfang_loss = guanfang_crt(
-        #     self.pred_mask, torch.argmax(self.gt_mask, dim=1, keepdim=True).squeeze(1)
-        # )
-        # print(f'guanfang忽略类别loss:{guanfang_loss}')
-        # loss = self.get_ignore_mask_loss(loss, ignore_index=self.ignore_index)
-        # print(f'忽略类别loss:{loss}')
-
-        # loss = loss * mask  # 应用掩码
-        # loss = loss.sum() / mask.sum()  # 仅计算非忽略像素的损失
+        )
         self.loss_G = loss
-        # if self.loss_mode == 'iou':
-        # self.loss_G += _iou_loss(self.pred_mask, self.gt_mask)
-
         self.loss_G.backward()
 
     def optimize_parameters(self):
         self.forward()
-        self.optimizer.zero_grad()  # set G's gradients to zero
-        self.backward_G()  # calculate graidents for G
-        self.optimizer.step()  # udpate G's weights
+        self.optimizer.zero_grad()
+        self.backward_G()
+        self.optimizer.step()
 
     def set_requires_grad(self, nets, requires_grad=False):
         """Set requies_grad=Fasle for all the networks to avoid unnecessary computations

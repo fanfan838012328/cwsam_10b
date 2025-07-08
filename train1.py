@@ -496,34 +496,143 @@ def main(config_, save_path, args):
 
     load_filtered_state_dict(model, sam_checkpoint)
     # model.load_state_dict(sam_checkpoint, strict=False)
+    
+    # ===== 分层MoE权重初始化逻辑 =====
+    def initialize_hierarchical_moe_from_1_5b(model, sam_checkpoint):
+        """
+        从1.5B模型的16个专家初始化分层MoE的6组×16个专家
+        策略1：复制+噪声 和 专家融合/插值
+        """
+        if local_rank == 0:
+            log("开始初始化分层MoE权重...")
+            
+        # 查找原始16个专家的权重
+        original_experts = {}
+        for key, value in sam_checkpoint.items():
+            if 'experts.' in key and 'image_encoder' in key:
+                # 解析专家索引，例如 'image_encoder.blocks.28.mlp.experts.0.0.weight'
+                parts = key.split('.')
+                expert_idx = None
+                for i, part in enumerate(parts):
+                    if part == 'experts' and i + 1 < len(parts):
+                        try:
+                            expert_idx = int(parts[i + 1])
+                            break
+                        except ValueError:
+                            continue
+                
+                if expert_idx is not None and 0 <= expert_idx < 16:
+                    # 重构key，移除layer信息，只保留专家相对路径
+                    expert_key = '.'.join(parts[parts.index('experts'):])
+                    original_experts[expert_key] = value
+        
+        if local_rank == 0:
+            log(f"找到 {len(original_experts)} 个原始专家权重")
+        
+        # 检查模型是否使用分层MoE
+        hierarchical_moe_layers = []
+        for name, module in model.named_modules():
+            if hasattr(module, 'use_hierarchical_moe') and module.use_hierarchical_moe:
+                hierarchical_moe_layers.append(name)
+        
+        if local_rank == 0:
+            log(f"找到 {len(hierarchical_moe_layers)} 个分层MoE层")
+        
+        # 为每个分层MoE层初始化专家权重
+        with torch.no_grad():
+            for layer_name in hierarchical_moe_layers:
+                layer_module = dict(model.named_modules())[layer_name]
+                if hasattr(layer_module, 'mlp') and hasattr(layer_module.mlp, 'expert_groups'):
+                    mlp_module = layer_module.mlp
+                    
+                    # 对6个专家组进行初始化
+                    for group_idx in range(6):  # 6个专家组
+                        expert_group = mlp_module.expert_groups[group_idx]
+                        
+                        # 对每组内的16个专家进行初始化
+                        for expert_idx in range(16):
+                            expert = expert_group[expert_idx]
+                            
+                            # 策略1：根据专家索引选择初始化方法
+                            if expert_idx < 16:  # 直接复制原专家 + 小噪声
+                                source_expert_idx = expert_idx
+                                noise_std = 0.02 * (group_idx + 1)  # 不同组使用不同噪声强度
+                                
+                                # 复制权重并添加噪声
+                                for orig_key, orig_weight in original_experts.items():
+                                    if f'experts.{source_expert_idx}.' in orig_key:
+                                        # 构建目标权重的路径
+                                        target_key = orig_key.replace(f'experts.{source_expert_idx}.', '')
+                                        
+                                        # 获取目标模块
+                                        target_parts = target_key.split('.')
+                                        target_module = expert
+                                        for part in target_parts[:-1]:
+                                            target_module = getattr(target_module, part)
+                                        
+                                        param_name = target_parts[-1]
+                                        if hasattr(target_module, param_name):
+                                            target_param = getattr(target_module, param_name)
+                                            
+                                            # 复制并添加噪声
+                                            copied_weight = orig_weight.clone()
+                                            noise = torch.randn_like(copied_weight) * noise_std
+                                            target_param.data.copy_(copied_weight + noise)
+                            
+                            else:  # 超出原专家数量，使用专家融合
+                                # 随机选择两个原专家进行插值
+                                expert1_idx = torch.randint(0, 16, (1,)).item()
+                                expert2_idx = torch.randint(0, 16, (1,)).item()
+                                
+                                # 随机插值权重
+                                alpha = torch.rand(1).item() * 0.6 + 0.2  # 0.2-0.8之间
+                                beta = 1.0 - alpha
+                                
+                                # 融合两个专家的权重
+                                for orig_key, orig_weight in original_experts.items():
+                                    if f'experts.{expert1_idx}.' in orig_key:
+                                        # 找到对应的第二个专家权重
+                                        expert2_key = orig_key.replace(f'experts.{expert1_idx}.', f'experts.{expert2_idx}.')
+                                        if expert2_key in original_experts:
+                                            expert2_weight = original_experts[expert2_key]
+                                            
+                                            # 线性插值
+                                            fused_weight = alpha * orig_weight + beta * expert2_weight
+                                            
+                                            # 设置到目标专家
+                                            target_key = orig_key.replace(f'experts.{expert1_idx}.', '')
+                                            target_parts = target_key.split('.')
+                                            target_module = expert
+                                            for part in target_parts[:-1]:
+                                                target_module = getattr(target_module, part)
+                                            
+                                            param_name = target_parts[-1]
+                                            if hasattr(target_module, param_name):
+                                                target_param = getattr(target_module, param_name)
+                                                target_param.data.copy_(fused_weight)
+                        
+                        # 初始化组内门控网络
+                        group_gate = mlp_module.expert_gates[group_idx]
+                        
+                        # 使用小的随机权重初始化门控网络
+                        if hasattr(group_gate, 'weight'):
+                            nn.init.normal_(group_gate.weight, mean=0.0, std=0.01)
+                        if hasattr(group_gate, 'bias') and group_gate.bias is not None:
+                            nn.init.constant_(group_gate.bias, 0.0)
+                    
+                    # 初始化第一级门控网络（专家组选择）
+                    if hasattr(mlp_module, 'group_gate'):
+                        nn.init.normal_(mlp_module.group_gate.weight, mean=0.0, std=0.01)
+                        if mlp_module.group_gate.bias is not None:
+                            nn.init.constant_(mlp_module.group_gate.bias, 0.0)
+        
+        if local_rank == 0:
+            log("分层MoE权重初始化完成")
+    
+    # 调用权重初始化函数
+    if config['model']['name'] == 'sam_hierarchical_moe_10b':
+        initialize_hierarchical_moe_from_1_5b(model, sam_checkpoint)
 
-
-    for name, para in model.named_parameters():
-        if "image_encoder" in name and "prompt_generator" not in name:
-            para.requires_grad_(False)
-        if "image_encoder" in name and "Adapter" in name:
-            para.requires_grad_(True)
-        if "image_encoder" in name and "experts" in name:
-            para.requires_grad_(True)
-        if "image_encoder" in name and "gate" in name:
-            para.requires_grad_(True)
-        # if "base_encoder" in name:
-        #     para.requires_grad_(False)
-        # if "large_encoder" in name:
-        #     para.requires_grad_(False)
-        # if "deeplabv3_plus" in name and "backbone" in name:
-        #     para.requires_grad_(False)
-        # if "deeplabv3_plus" in name and "aspp" in name:
-        #     para.requires_grad_(True)
-        # 1. SAM encoder相关参数
-                # 冻结SwinTransformerV2主干网络,只训练最后几层
-        # if "swinv2" in name:
-        #     if "layers.2" in name and '17' in name:  # 只训练最后一个stage的block块
-        #         para.requires_grad_(True)
-        #     elif "layers.2" in name and 'downsample' in name:
-        #         para.requires_grad_(True)
-        #     else:
-        #         para.requires_grad_(False)
     print_model_parameters(model)
     if local_rank == 0:
         model_total_params = sum(p.numel() for p in model.parameters())

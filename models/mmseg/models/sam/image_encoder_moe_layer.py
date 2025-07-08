@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 from typing import Optional, Tuple, Type
 
@@ -26,7 +27,10 @@ import os
 TORCH_MAJOR = int(torch.__version__.split('.')[0])
 TORCH_MINOR = int(torch.__version__.split('.')[1])
 if TORCH_MAJOR == 1 and TORCH_MINOR < 8:
-    from torch._six import container_abcs
+    try:
+        from torch._six import container_abcs
+    except ImportError:
+        import collections.abc as container_abcs
 else:
     import collections.abc as container_abcs
 
@@ -184,13 +188,13 @@ class ImageEncoderViT(nn.Module):
 
         return x
     
-    def vis_handcrafted(self, x: torch.Tensor) -> torch.Tensor:
+    def vis_handcrafted(self, x: torch.Tensor) -> None:
         inp = x
         x = self.patch_embed(x)
         ################# adaptor
         #embedding_feature = self.prompt_generator.init_embeddings(x)
         #handcrafted_feature = self.prompt_generator.init_handcrafted(inp)
-        inv = self.fft(inp, self.freq_nums)
+        inv = self.prompt_generator.fft(inp, self.freq_nums)
         array = inv.squeeze().cpu().numpy()
         
         array = (array * 255).astype(np.uint8)
@@ -205,7 +209,7 @@ def to_2tuple(x):
     return tuple(repeat(x, 2))
 
 def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
-    # type: (Tensor, float, float, float, float) -> Tensor
+    # type: (torch.Tensor, float, float, float, float) -> torch.Tensor
     r"""Fills the input Tensor with values drawn from a truncated
     normal distribution. The values are effectively drawn from the
     normal distribution :math:`\mathcal{N}(\text{mean}, \text{std}^2)`
@@ -259,192 +263,6 @@ def _no_grad_trunc_normal_(tensor, mean, std, a, b):
         tensor.clamp_(min=a, max=b)
         return tensor
 
-
-# class PromptGenerator(nn.Module):
-#     def __init__(self, scale_factor, prompt_type, embed_dim, tuning_stage, depth, input_type,
-#                  freq_nums, handcrafted_tune, embedding_tune, adaptor, img_size, patch_size):
-#         """
-#         Args:
-#         """
-#         super(PromptGenerator, self).__init__()
-#         self.scale_factor = scale_factor
-#         self.prompt_type = prompt_type
-#         self.embed_dim = embed_dim
-#         self.input_type = input_type
-#         self.freq_nums = freq_nums
-#         self.tuning_stage = tuning_stage
-#         self.depth = depth
-#         self.handcrafted_tune = handcrafted_tune
-#         self.embedding_tune = embedding_tune
-#         self.adaptor = adaptor
-
-#         self.shared_mlp = nn.Linear(self.embed_dim//self.scale_factor, self.embed_dim)
-#         self.embedding_generator = nn.Linear(self.embed_dim, self.embed_dim//self.scale_factor)
-#         for i in range(self.depth):
-
-#             lightweight_mlp = nn.Sequential(
-#                 nn.Linear(self.embed_dim//self.scale_factor, self.embed_dim//self.scale_factor),
-#                 nn.GELU(),
-#                 #nn.Linear(self.embed_dim//self.scale_factor, self.embed_dim)
-#             )
-
-
-
-#             ###### add by pxy 230706 #########
-#             # lightweight_mlp = MLP(self.embed_dim//self.scale_factor, self.embed_dim//self.scale_factor,self.embed_dim//self.scale_factor, self.embed_dim//self.scale_factor,3)
-
-#             ###########
-
-
-#             setattr(self, 'lightweight_mlp_{}'.format(str(i)), lightweight_mlp)
-
-#         self.prompt_generator = PatchEmbed2(img_size=img_size,
-#                                                    patch_size=patch_size, in_chans=3,
-#                                                    embed_dim=self.embed_dim//self.scale_factor)
-
-#         self.apply(self._init_weights)
-
-#     def _init_weights(self, m):
-#         if isinstance(m, nn.Linear):
-#             trunc_normal_(m.weight, std=.02)
-#             if isinstance(m, nn.Linear) and m.bias is not None:
-#                 nn.init.constant_(m.bias, 0)
-#         elif isinstance(m, nn.LayerNorm):
-#             nn.init.constant_(m.bias, 0)
-#             nn.init.constant_(m.weight, 1.0)
-#         elif isinstance(m, nn.Conv2d):
-#             fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-#             fan_out //= m.groups
-#             m.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
-#             if m.bias is not None:
-#                 m.bias.data.zero_()
-
-#     def init_embeddings(self, x):
-#         N, C, H, W = x.permute(0, 3, 1, 2).shape  #[1,64,64,768]
-#         x = x.reshape(N, C, H*W).permute(0, 2, 1) #[1,4096,768]
-#         return self.embedding_generator(x)
-
-#     def init_handcrafted(self, x):
-#         x = self.fft(x, self.freq_nums) #[1,3,1024,1024]
-#         return self.prompt_generator(x)
-
-#     def get_prompt(self, handcrafted_feature, embedding_feature):
-#         N, C, H, W = handcrafted_feature.shape
-#         handcrafted_feature = handcrafted_feature.view(N, C, H*W).permute(0, 2, 1) #[1,4096,24]
-#         prompts = []
-#         for i in range(self.depth):
-#             lightweight_mlp = getattr(self, 'lightweight_mlp_{}'.format(str(i)))
-#             # prompt = proj_prompt(prompt)
-#             prompt = lightweight_mlp(handcrafted_feature + embedding_feature) #[1,4096,24]
-#             prompts.append(self.shared_mlp(prompt))  
-#             #prompts.append(prompt)
-#         return prompts #12*[1,4096,768]
-
-#     def forward(self, x):
-#         if self.input_type == 'laplacian':
-#             pyr_A = self.lap_pyramid.pyramid_decom(img=x, num=self.freq_nums)
-#             x = pyr_A[:-1]
-#             laplacian = x[0]
-#             for x_i in x[1:]:
-#                 x_i = F.interpolate(x_i, size=(laplacian.size(2), laplacian.size(3)), mode='bilinear', align_corners=True)
-#                 laplacian = torch.cat([laplacian, x_i], dim=1)
-#             x = laplacian
-#         elif self.input_type == 'fft':
-#             x = self.fft(x, self.freq_nums)
-#         elif self.input_type == 'all':
-#             x = self.prompt.unsqueeze(0).repeat(x.shape[0], 1, 1, 1)
-
-#         # get prompting
-#         prompt = self.prompt_generator(x)
-
-#         if self.mode == 'input':
-#             prompt = self.proj(prompt)
-#             return prompt
-#         elif self.mode == 'stack':
-#             prompts = []
-#             for i in range(self.depth):
-#                 proj = getattr(self, 'proj_{}'.format(str(i)))
-#                 prompts.append(proj(prompt))
-#             return prompts
-#         elif self.mode == 'hierarchical':
-#             prompts = []
-#             for i in range(self.depth):
-#                 proj_prompt = getattr(self, 'proj_prompt_{}'.format(str(i)))
-#                 prompt = proj_prompt(prompt)
-#                 prompts.append(self.proj_token(prompt))
-#             return prompts
-
-#     def fft(self, x, rate):
-#         # the smaller rate, the smoother; the larger rate, the darker
-#         # rate = 4, 8, 16, 32
-#         #rate=1/16
-#         mask = torch.zeros(x.shape).to(x.device)
-#         w, h = x.shape[-2:]
-#         line = int((w * h * rate) ** .5 // 2)
-#         mask[:, :, w//2-line:w//2+line, h//2-line:h//2+line] = 1
-
-#         fft = torch.fft.fftshift(torch.fft.fft2(x, norm="forward"))
-#         # mask[fft.float() > self.freq_nums] = 1
-#         # high pass: 1-mask, low pass: mask
-#         #fft = fft * (1 - mask)
-#         fft_low = fft * mask
-#         fr_low = fft_low.real
-#         fi_low = fft_low.imag
-
-#         fft_hires_low = torch.fft.ifftshift(torch.complex(fr_low, fi_low))
-#         inv_low = torch.fft.ifft2(fft_hires_low, norm="forward").real
-
-#         inv_low = torch.abs(inv_low)
-
-
-
-#         fft_high = fft * (1-mask)
-#         fr_high = fft_high.real
-#         fi_high = fft_high.imag
-
-#         fft_hires_high = torch.fft.ifftshift(torch.complex(fr_high, fi_high))
-#         inv_high = torch.fft.ifft2(fft_hires_high, norm="forward").real
-
-#         inv_high = torch.abs(inv_high)
-
-
-#     #     ran_id=random.randint(1,10000)
-
-#     #     array = inv_low.squeeze().cpu().numpy()
-#     #     # 将像素值缩放到0-255之间
-#     #     array = (array * 255).astype(np.uint8)
-#     #     # 转换为RGB顺序
-#     #     array = np.transpose(array, (1, 2, 0))
-#     #     # 创建图像对象
-#     #     image = Image.fromarray(array, mode='RGB')
-#     #     # 保存图像
-#     #     #os.makedirs('/remote-home/pxy/CWSAM/vis_after_fft_low/')
-#     #     image.save('/remote-home/pxy/CWSAM/vis_after_fft_low/'+str(ran_id)+'.jpg')
-
-#     #     array_h = inv_high.squeeze().cpu().numpy()
-#     #     # 将像素值缩放到0-255之间
-#     #     array_h = (array_h * 255).astype(np.uint8)
-#     #     # 转换为RGB顺序
-
-
-
-#     #     array_h = np.transpose(array_h, (1, 2, 0))
-#     #     # 创建图像对象
-#     #     image = Image.fromarray(array_h, mode='RGB')
-#     #     # 保存图像
-#     #    # os.makedirs('/remote-home/pxy/CWSAM/vis_after_fft_high/')
-#     #     image.save('/remote-home/pxy/CWSAM/vis_after_fft_high/'+str(ran_id)+'.jpg')
-
-#     #     x_array = x.squeeze().cpu().numpy()
-#     #     x_array = (x_array * 255).astype(np.uint8)
-#     #     x_array = np.transpose(x_array, (1, 2, 0))
-#     #     x_image = Image.fromarray(x_array, mode='RGB')
-#     #     #os.makedirs('/remote-home/pxy/CWSAM/vis_inp/')
-#     #     x_image.save('/remote-home/pxy/CWSAM/vis_inp/'+str(ran_id)+'.jpg')
-
-#         #return torch.cat((inv_low,inv_high), dim=1)
-
-#         return inv_low
 
 class PromptGenerator(nn.Module):
     def __init__(self, scale_factor, prompt_type, embed_dim, tuning_stage, depth, input_type,
@@ -576,7 +394,15 @@ class PromptGenerator(nn.Module):
         rate = max(0.01, min(0.99, rate))
         
         try:
-            with torch.cuda.amp.autocast(enabled=False):
+            # 兼容不同版本的PyTorch autocast导入
+            try:
+                with torch.cuda.amp.autocast(enabled=False):
+                    pass
+                autocast_context = torch.cuda.amp.autocast(enabled=False)
+            except AttributeError:
+                autocast_context = torch.autocast(device_type='cuda', enabled=False)
+            
+            with autocast_context:
                 x = x_orig.float()  # 转换为float32以提高FFT操作的稳定性
                 
                 # 预处理：确保输入值在合理范围内
@@ -1016,4 +842,279 @@ class MLP(nn.Module):
             x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         if self.sigmoid_output:
             x = F.sigmoid(x)
+        return x
+
+
+class ImageEncoderViT_hierarchical_moe(nn.Module):
+    """
+    分层MoE的Vision Transformer编码器
+    - 垂直扩展：从32层扩展到40层
+    - 水平扩展：使用分层MoE，6个专家组，每组16个专家
+    """
+    def __init__(
+        self,
+        img_size: int = 1024,
+        patch_size: int = 16,
+        in_chans: int = 3,
+        embed_dim: int = 1280,
+        depth: int = 40,  # 垂直扩展：从32层增加到40层
+        num_heads: int = 16,
+        mlp_ratio: float = 4.0,
+        out_chans: int = 256,
+        qkv_bias: bool = True,
+        norm_layer: Type[nn.Module] = nn.LayerNorm,
+        act_layer: Type[nn.Module] = nn.GELU,
+        use_abs_pos: bool = True,
+        use_rel_pos: bool = False,
+        rel_pos_zero_init: bool = True,
+        window_size: int = 0,
+        global_attn_indexes: Tuple[int, ...] = (),
+        # 分层MoE相关参数
+        moe_num_expert_groups: int = 6,    # 专家组数量
+        moe_experts_per_group: int = 16,   # 每组内的专家数量
+        moe_k_groups: int = 2,             # 选择的专家组数量
+        moe_k_experts: int = 4,            # 每组内选择的专家数量
+        moe_noisy_gating: bool = True,
+        moe_start_layer_index: int = 24,   # 从第24层开始应用分层MoE
+    ) -> None:
+        """
+        Args:
+            img_size (int): Input image size.
+            patch_size (int): Patch size.
+            in_chans (int): Number of input image channels.
+            embed_dim (int): Patch embedding dimension.
+            depth (int): Depth of ViT.
+            num_heads (int): Number of attention heads in each ViT block.
+            mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+            qkv_bias (bool): If True, add a learnable bias to query, key, value.
+            norm_layer (nn.Module): Normalization layer.
+            act_layer (nn.Module): Activation layer.
+            use_abs_pos (bool): If True, use absolute positional embeddings.
+            use_rel_pos (bool): If True, add relative positional embeddings to the attention map.
+            rel_pos_zero_init (bool): If True, zero initialize relative positional parameters.
+            window_size (int): Window size for window attention blocks.
+            global_attn_indexes (list): Indexes for blocks using global attention.
+            moe_num_expert_groups (int): 分层MoE专家组数量.
+            moe_experts_per_group (int): 每组内的专家数量.
+            moe_k_groups (int): 选择的专家组数量.
+            moe_k_experts (int): 每组内选择的专家数量.
+            moe_noisy_gating (bool): 是否使用噪声门控.
+            moe_start_layer_index (int): 从第几层开始应用分层MoE.
+        """
+        super().__init__()
+        self.img_size = img_size
+        self.embed_dim = embed_dim
+        self.depth = depth
+        self.moe_start_layer_index = moe_start_layer_index
+
+        self.patch_embed = PatchEmbed(
+            kernel_size=(patch_size, patch_size),
+            stride=(patch_size, patch_size),
+            in_chans=in_chans,
+            embed_dim=embed_dim,
+        )
+
+        self.pos_embed: Optional[nn.Parameter] = None
+        if use_abs_pos:
+            # Initialize absolute positional embedding with pretrain image size.
+            self.pos_embed = nn.Parameter(
+                torch.zeros(1, img_size // patch_size, img_size // patch_size, embed_dim)
+            )
+
+        self.blocks = nn.ModuleList()
+        for i in range(depth): 
+            # 前24层使用标准MLP，后面的层使用分层MoE
+            use_hierarchical_moe = (i >= self.moe_start_layer_index)
+            
+            block = HierarchicalBlock(
+                dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                norm_layer=norm_layer,
+                act_layer=act_layer,
+                use_rel_pos=use_rel_pos,
+                rel_pos_zero_init=rel_pos_zero_init,
+                window_size=window_size if i not in global_attn_indexes else 0,
+                input_size=(img_size // patch_size, img_size // patch_size),
+                # 分层MoE参数
+                num_expert_groups=moe_num_expert_groups,
+                experts_per_group=moe_experts_per_group,
+                k_groups=moe_k_groups,
+                k_experts=moe_k_experts,
+                noisy_gating=moe_noisy_gating,
+                use_hierarchical_moe=use_hierarchical_moe
+            )
+            self.blocks.append(block)
+
+        self.neck = nn.Sequential(
+            nn.Conv2d(
+                embed_dim,
+                out_chans,
+                kernel_size=1,
+                bias=False,
+            ),
+            LayerNorm2d(out_chans),
+            nn.Conv2d(
+                out_chans,
+                out_chans,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            LayerNorm2d(out_chans),
+        )
+
+        # adaptor - 保持原有的prompt generator
+        self.scale_factor = 32
+        self.prompt_type = 'highpass'
+        self.tuning_stage = 1234
+        self.input_type = 'fft'
+        self.freq_nums = 0.25
+        self.handcrafted_tune = True
+        self.embedding_tune = True
+        self.adaptor = 'adaptor'
+        self.prompt_generator = PromptGenerator(self.scale_factor, self.prompt_type, self.embed_dim,
+                                                self.tuning_stage, self.depth,
+                                                self.input_type, self.freq_nums,
+                                                self.handcrafted_tune, self.embedding_tune, self.adaptor,
+                                                img_size, patch_size)
+        self.num_stages = self.depth
+        self.out_indices = tuple(range(self.num_stages))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        inp = x  #[1,3,1024,1024]
+        x = self.patch_embed(x)  #[1,64,64,768]
+        
+        # adaptor
+        # 初始化嵌入特征
+        embedding_feature = self.prompt_generator.init_embeddings(x) #[1,4096,24] 
+        # 初始化手工特征 通过fft提取图片中的频率信息
+        handcrafted_feature = self.prompt_generator.init_handcrafted(inp) #[1,24,64,64]
+        # 结合两种特征，生成prompt
+        prompt = self.prompt_generator.get_prompt(handcrafted_feature, embedding_feature)
+       
+        if self.pos_embed is not None:
+            x = x + self.pos_embed
+
+        B, H, W = x.shape[0], x.shape[1], x.shape[2]  #1,64,64
+        outs = []
+        # 遍历blocks
+        for i, blk in enumerate(self.blocks):
+            # 为每一个Transformer层生成特定的prompt
+            x = prompt[i].reshape(B, H, W, -1) + x
+            x = blk(x)  #[1,64,64,768]
+            if i in self.out_indices:
+                outs.append(x)
+                
+        # neck特征融合层
+        x = self.neck(x.permute(0, 3, 1, 2))  #[1,256,64,64]
+
+        return x
+
+
+class HierarchicalBlock(nn.Module):
+    """支持分层MoE的Transformer Block"""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        scale: float = 0.5,
+        qkv_bias: bool = True,
+        norm_layer: Type[nn.Module] = nn.LayerNorm,
+        act_layer: Type[nn.Module] = nn.GELU,
+        use_rel_pos: bool = False,
+        rel_pos_zero_init: bool = True,
+        window_size: int = 0,
+        input_size: Optional[Tuple[int, int]] = None,
+        # 分层MoE参数
+        num_expert_groups: int = 6,
+        experts_per_group: int = 16,
+        k_groups: int = 2,
+        k_experts: int = 4,
+        noisy_gating: bool = True,
+        use_hierarchical_moe: bool = True,
+    ) -> None:
+        """
+        Args:
+            dim (int): Number of input channels.
+            num_heads (int): Number of attention heads in each ViT block.
+            mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+            qkv_bias (bool): If True, add a learnable bias to query, key, value.
+            norm_layer (nn.Module): Normalization layer.
+            act_layer (nn.Module): Activation layer.
+            use_rel_pos (bool): If True, add relative positional embeddings to the attention map.
+            rel_pos_zero_init (bool): If True, zero initialize relative positional parameters.
+            window_size (int): Window size for window attention blocks. If it equals 0, then
+                use global attention.
+            input_size (tuple(int, int) or None): Input resolution for calculating the relative
+                positional parameter size.
+            num_expert_groups (int): 分层MoE专家组数量.
+            experts_per_group (int): 每组内的专家数量.
+            k_groups (int): 选择的专家组数量.
+            k_experts (int): 每组内选择的专家数量.
+            noisy_gating (bool): 是否使用噪声门控.
+            use_hierarchical_moe (bool): 是否在本层使用分层MoE.
+        """
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            use_rel_pos=use_rel_pos,
+            rel_pos_zero_init=rel_pos_zero_init,
+            input_size=input_size if window_size == 0 else (window_size, window_size),
+        )
+        self.MLP_Adapter = Adapter(dim, skip_connect=False)  # MLP-adapter, no skip connection
+        self.Space_Adapter = Adapter(dim)  # with skip connection
+        self.scale = scale
+        self.Depth_Adapter = Adapter(dim, skip_connect=False)  # no skip connection
+
+        self.norm2 = norm_layer(dim)
+        self.use_hierarchical_moe = use_hierarchical_moe
+        
+        if self.use_hierarchical_moe:
+            # 使用分层MoE
+            from .common import HierarchicalMoEMLPBlock
+            self.mlp = HierarchicalMoEMLPBlock(
+                embedding_dim=dim,
+                mlp_dim=int(dim * mlp_ratio),
+                act=act_layer,
+                num_expert_groups=num_expert_groups,
+                experts_per_group=experts_per_group,
+                k_groups=k_groups,
+                k_experts=k_experts,
+                noisy_gating=noisy_gating
+            )
+        else:
+            # 使用标准MLP
+            self.mlp = MLPBlock(
+                embedding_dim=dim,
+                mlp_dim=int(dim * mlp_ratio),
+                act=act_layer
+            )
+
+        self.window_size = window_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shortcut = x
+        x = self.norm1(x)
+        # Window partition
+        if self.window_size > 0:
+            H, W = x.shape[1], x.shape[2]
+            x, pad_hw = window_partition(x, self.window_size)
+
+        x = self.attn(x)
+        x = self.Space_Adapter(x)
+        # Reverse window partition
+        if self.window_size > 0:
+            x = window_unpartition(x, self.window_size, pad_hw, (H, W))
+
+        x = shortcut + x
+        xn = self.norm2(x)
+        x = x + self.mlp(xn) + self.scale * self.MLP_Adapter(xn)
+        
         return x
