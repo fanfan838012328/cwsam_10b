@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import timm
 import math
 from models import register
+from torch.cuda.amp.autocast_mode import autocast
 
 
 # from transformers import ViTModel
@@ -30,12 +31,12 @@ def onehot_to_mask(mask, palette):
     """
     Converts a mask (H, W, K) to (H, W, C)
     """
-    mask = mask.permute(1, 2, 0)
+    mask = mask.permute(1, 2, 0).cpu().numpy()
     x = np.argmax(mask, axis=-1)
     colour_codes = np.array(palette)
     x = np.uint8(colour_codes[x.astype(np.uint8)])
-    x = x.permute(2, 0, 1)
-    return x
+    x = np.transpose(x, (2, 0, 1))  # 使用numpy的transpose代替permute
+    return torch.from_numpy(x)
 
 
 def init_weights(layer):
@@ -102,6 +103,8 @@ class PositionEmbeddingRandom(nn.Module):
         """Positionally encode points that are normalized to [0,1]."""
         # assuming coords are in [0, 1]^2 square and have d_1 x ... x d_n x 2 shape
         coords = 2 * coords - 1
+        # 确保coords与gaussian matrix的数据类型一致
+        coords = coords.to(self.positional_encoding_gaussian_matrix.dtype)
         coords = coords @ self.positional_encoding_gaussian_matrix
         coords = 2 * np.pi * coords
         # outputs d_1 x ... x d_n x C shape
@@ -111,7 +114,9 @@ class PositionEmbeddingRandom(nn.Module):
         """Generate positional encoding for a grid of the specified size."""
         h, w = size, size
         device: Any = self.positional_encoding_gaussian_matrix.device
-        grid = torch.ones((h, w), device=device, dtype=torch.float32)
+        # 使用与gaussian matrix相同的数据类型
+        dtype = self.positional_encoding_gaussian_matrix.dtype
+        grid = torch.ones((h, w), device=device, dtype=dtype)
         y_embed = grid.cumsum(dim=0) - 0.5
         x_embed = grid.cumsum(dim=1) - 0.5
         y_embed = y_embed / h
@@ -451,6 +456,8 @@ class SAM_HIERARCHICAL_MOE_10B(nn.Module):
             self.criterionBCE = BBCEWithLogitLoss()
 
         elif self.loss_mode == 'iou':
+            # self.criterionBCE = torch.nn.BCEWithLogitsLoss()
+            # pos_weight = torch.tensor([1.5, 1, 0.5, 1.9, 0.1], dtype=torch.float)
             if loss_weight is not None:
                 pos_weight = torch.tensor(loss_weight, dtype=torch.float)
                 self.criterionBCE = torch.nn.CrossEntropyLoss(
@@ -469,7 +476,9 @@ class SAM_HIERARCHICAL_MOE_10B(nn.Module):
         self.no_mask_embed = nn.Embedding(1, encoder_mode['prompt_embed_dim'])
 
     def set_input(self, input, gt_mask):
+        # 输入数据使用autocast自动管理精度，不强制转换
         self.input = input.to(self.device)
+        # gt_mask保持原始精度用于损失计算
         self.gt_mask = gt_mask.to(self.device)
 
     def get_dense_pe(self) -> torch.Tensor:
@@ -486,54 +495,62 @@ class SAM_HIERARCHICAL_MOE_10B(nn.Module):
     def forward(self):
         bs = self.input.shape[0]
 
-        # Embed prompts
-        sparse_embeddings = torch.empty(
-            (bs, 0, self.prompt_embed_dim), device=self.input.device
-        )
-        dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
-            bs, -1, self.image_embedding_size, self.image_embedding_size
-        )
+        # 使用autocast进行混合精度前向传播
+        with torch.cuda.amp.autocast():
+            # Embed prompts - 确保embedding的精度一致
+            target_dtype = self.no_mask_embed.weight.dtype
+            sparse_embeddings = torch.empty(
+                (bs, 0, self.prompt_embed_dim), device=self.input.device, dtype=target_dtype
+            )
+            dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+                bs, -1, self.image_embedding_size, self.image_embedding_size
+            )
 
-        self.features = self.image_encoder(self.input)
+            # 使用autocast自动管理精度
+            self.features = self.image_encoder(self.input)
 
-        # Predict masks
-        low_res_masks, iou_predictions = self.mask_decoder(
-            image_embeddings=self.features,
-            image_pe=self.get_dense_pe(),
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
-            multimask_output=False,
-        )
+            # Predict masks
+            low_res_masks, iou_predictions = self.mask_decoder(
+                image_embeddings=self.features,
+                image_pe=self.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=False,
+            )
 
-        # Upscale the masks to the original image resolution
-        masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
-        self.pred_mask = masks
+            # Upscale the masks to the original image resolution
+            masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
+            self.pred_mask = masks
 
     def infer(self, input):
         bs = input.shape[0]
 
-        # Embed prompts
-        sparse_embeddings = torch.empty(
-            (bs, 0, self.prompt_embed_dim), device=input.device
-        )
-        dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
-            bs, -1, self.image_embedding_size, self.image_embedding_size
-        )
+        # 使用autocast进行混合精度推理
+        with torch.cuda.amp.autocast():
+            # Embed prompts - 确保embedding的精度一致
+            target_dtype = self.no_mask_embed.weight.dtype
+            sparse_embeddings = torch.empty(
+                (bs, 0, self.prompt_embed_dim), device=input.device, dtype=target_dtype
+            )
+            dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+                bs, -1, self.image_embedding_size, self.image_embedding_size
+            )
 
-        self.features = self.image_encoder(input)
+            # 使用autocast自动管理精度
+            features = self.image_encoder(input)
 
-        # Predict masks
-        low_res_masks, iou_predictions = self.mask_decoder(
-            image_embeddings=self.features,
-            image_pe=self.get_dense_pe(),
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
-            multimask_output=False,
-        )
+            # Predict masks
+            low_res_masks, iou_predictions = self.mask_decoder(
+                image_embeddings=features,
+                image_pe=self.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=False,
+            )
 
-        # Upscale the masks to the original image resolution
-        masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
-        return masks
+            # Upscale the masks to the original image resolution
+            masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
+            return masks
 
     def postprocess_masks(
         self,
@@ -569,7 +586,7 @@ class SAM_HIERARCHICAL_MOE_10B(nn.Module):
         )
         return masks
 
-    def get_ignore_mask_loss(self, loss, ignore_index: list = None):
+    def get_ignore_mask_loss(self, loss, ignore_index=None):
         """Create a mask to ignore certain pixels in the ground truth."""
         mask = torch.ones_like(loss, device=loss.device)
 
@@ -582,17 +599,43 @@ class SAM_HIERARCHICAL_MOE_10B(nn.Module):
 
     def backward_G(self):
         """Calculate GAN and L1 loss for the generator"""
-        loss = self.criterionBCE(
-            self.pred_mask, torch.argmax(self.gt_mask, dim=1, keepdim=True).squeeze(1)
-        )
-        self.loss_G = loss
-        self.loss_G.backward()
+        # 确保数据类型一致，避免fp16/fp32混合导致的错误
+        pred_mask = self.pred_mask
+        gt_target = torch.argmax(self.gt_mask, dim=1, keepdim=True).squeeze(1)
+        
+        # 损失计算使用fp32精度以提高数值稳定性
+        # 强制转换预测结果为fp32，确保彻底转换
+        with torch.cuda.amp.autocast(enabled=False):
+            pred_mask = pred_mask.float()
+            
+            # 确保target是long类型
+            if gt_target.dtype != torch.long:
+                gt_target = gt_target.long()
+            
+            # 如果criterionBCE有权重参数，也需要转为fp32
+            if hasattr(self.criterionBCE, 'weight') and self.criterionBCE.weight is not None:
+                if self.criterionBCE.weight.dtype != torch.float32:
+                    self.criterionBCE.weight.data = self.criterionBCE.weight.data.float()
+            
+            loss = self.criterionBCE(pred_mask, gt_target)
+            self.loss_G = loss
+        
+        # 使用scaler进行backward，支持混合精度训练
+        if hasattr(self, 'scaler') and self.scaler is not None:
+            self.scaler.scale(self.loss_G).backward()
+        else:
+            self.loss_G.backward()
 
     def optimize_parameters(self):
         self.forward()
         self.optimizer.zero_grad()
         self.backward_G()
-        self.optimizer.step()
+        # 使用scaler更新参数，支持混合精度训练
+        if hasattr(self, 'scaler') and self.scaler is not None:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
 
     def set_requires_grad(self, nets, requires_grad=False):
         """Set requies_grad=Fasle for all the networks to avoid unnecessary computations

@@ -444,7 +444,7 @@ test_dataset:
       inp_size: 512
   batch_size: 1
 eval_type: seg
-sam_checkpoint: /public/home/daiwenxuan/project/pretrained_weights/sam_vit_h_4b8939.pth
+sam_checkpoint: /mnt/fanfq/data/fan/cwsam/save/XinTong_sam_vit_h_moe_3b/model_epoch_121.pth
 data_norm:
   inp:
     sub:
@@ -520,7 +520,7 @@ model:
       embedding_tune: true
       adaptor: adaptor
       embed_dim: 1280
-      depth: 40
+      depth: 32
       num_heads: 16
       global_attn_indexes:
       - 7
@@ -528,7 +528,7 @@ model:
       - 23
       - 31
       - 39
-      moe_num_expert_groups: 6
+      moe_num_expert_groups: 5
       moe_experts_per_group: 16
       moe_k_groups: 2
       moe_k_experts: 4

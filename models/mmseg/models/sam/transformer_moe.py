@@ -224,6 +224,12 @@ class Attention(nn.Module):
         return x.reshape(b, n_tokens, n_heads * c_per_head)  # B x N_tokens x C
 
     def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        # 确保输入tensor与模型权重的数据类型一致
+        target_dtype = self.q_proj.weight.dtype
+        q = q.to(target_dtype)
+        k = k.to(target_dtype)
+        v = v.to(target_dtype)
+        
         # Input projections
         q = self.q_proj(q)
         k = self.k_proj(k)

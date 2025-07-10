@@ -12,7 +12,9 @@ import utils
 from statistics import mean
 import torch
 import torch.distributed as dist
-
+from torch.cuda.amp.autocast_mode import autocast
+from torch.cuda.amp.grad_scaler import GradScaler
+import bitsandbytes as bnb
 
 import numpy as np
 from eval_iou import SegmentationMetric
@@ -158,10 +160,6 @@ def eval_psnr(loader, model, config):
     # 较大的批处理大小，因为现在只用一个GPU处理
     batch_limit = 8
     
-    # 存储预测和真实标签
-    pred_list = []
-    gt_list = []
-    
     if eval_type == 'seg':
         # 准备标签缓存
         mask_labels = []
@@ -171,11 +169,13 @@ def eval_psnr(loader, model, config):
         batch_count += 1
         
         for k, v in batch.items():
+            # 不再强制转换输入为fp16，让autocast自动管理精度
             batch[k] = v.to(device)
 
         inp = batch['inp']
 
         with torch.no_grad():
+            # 使用autocast进行混合精度推理
             output_masks = model.infer(inp)
             pred = torch.sigmoid(output_masks)
         
@@ -331,11 +331,25 @@ def eval_psnr(loader, model, config):
     return val_metric1_avg, val_metric2_avg, val_metric3_avg, val_metric4_avg, metric1, metric2, metric3, metric4, table, normed_confusionMatrix
 
 
+def log_gpu_memory(stage=""):
+    """记录GPU显存使用情况"""
+    if local_rank == 0 and torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+        log(f"GPU Memory {stage}: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+
 def prepare_training():
     model = models.make(config['model'])
     
-    # 先将模型转换为 DDP
+    # 将模型移到GPU，但保持fp32参数以支持混合精度训练
     model = model.cuda()
+    log_gpu_memory("after model.cuda()")
+    
+    if local_rank == 0:
+        log("Using mixed precision training (autocast) instead of model.half() for better gradient stability...")
+    # 不再使用model.half()，而是使用autocast进行混合精度训练
+    log_gpu_memory("after model setup")
+    
     model = torch.nn.parallel.DistributedDataParallel(
         model,
         device_ids=[local_rank],
@@ -343,8 +357,21 @@ def prepare_training():
         find_unused_parameters=True,
         broadcast_buffers=False,
     )
+    log_gpu_memory("after DDP")
     
-    optimizer = utils.make_optimizer(model.parameters(), config['optimizer'])
+    # 使用8位优化器减少显存占用
+    optimizer = bnb.optim.AdamW8bit(
+        model.parameters(), 
+        lr=config['optimizer']['args']['lr'], 
+        betas=config['optimizer']['args'].get('betas', (0.9, 0.999)),
+        eps=config['optimizer']['args'].get('eps', 1e-8),
+        weight_decay=config['optimizer']['args'].get('weight_decay', 0)
+    )
+    log_gpu_memory("after 8-bit optimizer")
+    
+    # 初始化混合精度训练的GradScaler
+    scaler = GradScaler()
+    log_gpu_memory("after scaler")
     
     # 加载 checkpoint
     if config.get('resume') is not None:
@@ -389,8 +416,8 @@ def prepare_training():
     if local_rank == 0:
         log('model: #params={}'.format(utils.compute_num_params(model, text=True)))
     
-    return model.module, optimizer, epoch_start, lr_scheduler
-def train(train_loader, model):
+    return model.module, optimizer, epoch_start, lr_scheduler, scaler
+def train(train_loader, model, scaler):
     model.train()
 
     if local_rank == 0:
@@ -401,24 +428,29 @@ def train(train_loader, model):
     loss_list = []
     for batch in train_loader:
         for k, v in batch.items():
+            # 不再强制转换输入为fp16，让autocast自动管理精度
             batch[k] = v.to(device)
         inp = batch['inp']
         gt = batch['gt']
         model.set_input(inp, gt)
+        # 设置scaler用于混合精度训练
+        model.scaler = scaler
         model.optimize_parameters()
-        batch_loss = [
+        batch_loss_tensors = [
             torch.zeros_like(model.loss_G) for _ in range(dist.get_world_size())
         ]
-        dist.all_gather(batch_loss, model.loss_G)
-        loss_list.extend(batch_loss)
+        dist.all_gather(batch_loss_tensors, model.loss_G)
+        # 立即提取标量值，避免在列表中积累张量
+        loss_list.extend([loss.item() for loss in batch_loss_tensors])
+
         if pbar is not None:
             pbar.update(1)
 
     if pbar is not None:
         pbar.close()
 
-    loss = [i.item() for i in loss_list]
-    return mean(loss)
+    # loss_list 现在已经包含标量，直接计算平均值
+    return mean(loss_list)
 
 
 # 在训练脚本中添加以下代码
@@ -457,21 +489,13 @@ def main(config_, save_path, args):
             'gt': {'sub': [0], 'div': [1]},
         }
 
-    model, optimizer, epoch_start, lr_scheduler = prepare_training()
+    model, optimizer, epoch_start, lr_scheduler, scaler = prepare_training()
     model.optimizer = optimizer
     lr_scheduler = CosineAnnealingLR(
         model.optimizer, config['epoch_max'], eta_min=config.get('lr_min')
     )
 
-    model = model.cuda()
-    model = torch.nn.parallel.DistributedDataParallel(
-        model,
-        device_ids=[args.local_rank],
-        output_device=args.local_rank,
-        find_unused_parameters=True,
-        broadcast_buffers=False,
-    )
-    model = model.module
+    # model已经在prepare_training()中处理过DDP并返回了unwrapped model
 
 
     sam_checkpoint = torch.load(config['sam_checkpoint'])
@@ -501,11 +525,22 @@ def main(config_, save_path, args):
     def initialize_hierarchical_moe_from_1_5b(model, sam_checkpoint):
         """
         从1.5B模型的16个专家初始化分层MoE的6组×16个专家
-        策略1：复制+噪声 和 专家融合/插值
+        策略1：第一个专家组放置原始16个专家并冻结，其他组使用复制+噪声和专家融合
         """
         if local_rank == 0:
             log("开始初始化分层MoE权重...")
-            
+        
+        # 首先检查模型是否使用分层MoE
+        hierarchical_moe_layers = []
+        for name, module in model.named_modules():
+            if hasattr(module, 'use_hierarchical_moe') and module.use_hierarchical_moe:
+                hierarchical_moe_layers.append(name)
+        
+        if len(hierarchical_moe_layers) == 0:
+            if local_rank == 0:
+                log("未找到分层MoE层，跳过初始化")
+            return
+        
         # 查找原始16个专家的权重
         original_experts = {}
         for key, value in sam_checkpoint.items():
@@ -529,12 +564,6 @@ def main(config_, save_path, args):
         if local_rank == 0:
             log(f"找到 {len(original_experts)} 个原始专家权重")
         
-        # 检查模型是否使用分层MoE
-        hierarchical_moe_layers = []
-        for name, module in model.named_modules():
-            if hasattr(module, 'use_hierarchical_moe') and module.use_hierarchical_moe:
-                hierarchical_moe_layers.append(name)
-        
         if local_rank == 0:
             log(f"找到 {len(hierarchical_moe_layers)} 个分层MoE层")
         
@@ -545,20 +574,27 @@ def main(config_, save_path, args):
                 if hasattr(layer_module, 'mlp') and hasattr(layer_module.mlp, 'expert_groups'):
                     mlp_module = layer_module.mlp
                     
-                    # 对6个专家组进行初始化
-                    for group_idx in range(6):  # 6个专家组
+                    # 动态获取实际的专家组数量
+                    actual_num_groups = len(mlp_module.expert_groups)
+                    actual_experts_per_group = len(mlp_module.expert_groups[0]) if actual_num_groups > 0 else 0
+                    
+                    if local_rank == 0:
+                        log(f"层 {layer_name}: 发现 {actual_num_groups} 个专家组，每组 {actual_experts_per_group} 个专家")
+                    
+                    # 对实际的专家组进行初始化
+                    for group_idx in range(actual_num_groups):
                         expert_group = mlp_module.expert_groups[group_idx]
                         
-                        # 对每组内的16个专家进行初始化
-                        for expert_idx in range(16):
-                            expert = expert_group[expert_idx]
+                        if group_idx == 0:
+                            # 第一个专家组：放置原始16个专家，精确复制权重（不添加噪声）
+                            if local_rank == 0:
+                                log(f"  初始化第一个专家组（原始专家，将被冻结）...")
                             
-                            # 策略1：根据专家索引选择初始化方法
-                            if expert_idx < 16:  # 直接复制原专家 + 小噪声
+                            for expert_idx in range(min(actual_experts_per_group, 16)):
+                                expert = expert_group[expert_idx]
                                 source_expert_idx = expert_idx
-                                noise_std = 0.02 * (group_idx + 1)  # 不同组使用不同噪声强度
                                 
-                                # 复制权重并添加噪声
+                                # 精确复制原始专家权重，不添加噪声
                                 for orig_key, orig_weight in original_experts.items():
                                     if f'experts.{source_expert_idx}.' in orig_key:
                                         # 构建目标权重的路径
@@ -573,34 +609,39 @@ def main(config_, save_path, args):
                                         param_name = target_parts[-1]
                                         if hasattr(target_module, param_name):
                                             target_param = getattr(target_module, param_name)
-                                            
-                                            # 复制并添加噪声
-                                            copied_weight = orig_weight.clone()
-                                            noise = torch.randn_like(copied_weight) * noise_std
-                                            target_param.data.copy_(copied_weight + noise)
+                                            # 精确复制，保持原始预训练权重
+                                            target_param.data.copy_(orig_weight.clone())
                             
-                            else:  # 超出原专家数量，使用专家融合
-                                # 随机选择两个原专家进行插值
-                                expert1_idx = torch.randint(0, 16, (1,)).item()
-                                expert2_idx = torch.randint(0, 16, (1,)).item()
+                            # 如果专家组有超过16个专家，其余的用随机初始化
+                            if actual_experts_per_group > 16:
+                                for expert_idx in range(16, actual_experts_per_group):
+                                    expert = expert_group[expert_idx]
+                                    # 使用随机初始化（小权重）
+                                    for module in expert.modules():
+                                        if isinstance(module, torch.nn.Linear):
+                                            torch.nn.init.normal_(module.weight, mean=0.0, std=0.01)
+                                            if module.bias is not None:
+                                                torch.nn.init.constant_(module.bias, 0.0)
+                        
+                        else:
+                            # 其他专家组：使用复制+噪声和专家融合策略
+                            if local_rank == 0:
+                                log(f"  初始化第{group_idx+1}个专家组（新专家，可训练）...")
+                            
+                            for expert_idx in range(actual_experts_per_group):
+                                expert = expert_group[expert_idx]
                                 
-                                # 随机插值权重
-                                alpha = torch.rand(1).item() * 0.6 + 0.2  # 0.2-0.8之间
-                                beta = 1.0 - alpha
-                                
-                                # 融合两个专家的权重
-                                for orig_key, orig_weight in original_experts.items():
-                                    if f'experts.{expert1_idx}.' in orig_key:
-                                        # 找到对应的第二个专家权重
-                                        expert2_key = orig_key.replace(f'experts.{expert1_idx}.', f'experts.{expert2_idx}.')
-                                        if expert2_key in original_experts:
-                                            expert2_weight = original_experts[expert2_key]
+                                if expert_idx < 16:
+                                    # 复制原始专家并添加噪声
+                                    source_expert_idx = expert_idx
+                                    noise_std = 0.02 * group_idx  # 不同组使用不同噪声强度
+                                    
+                                    for orig_key, orig_weight in original_experts.items():
+                                        if f'experts.{source_expert_idx}.' in orig_key:
+                                            # 构建目标权重的路径
+                                            target_key = orig_key.replace(f'experts.{source_expert_idx}.', '')
                                             
-                                            # 线性插值
-                                            fused_weight = alpha * orig_weight + beta * expert2_weight
-                                            
-                                            # 设置到目标专家
-                                            target_key = orig_key.replace(f'experts.{expert1_idx}.', '')
+                                            # 获取目标模块
                                             target_parts = target_key.split('.')
                                             target_module = expert
                                             for part in target_parts[:-1]:
@@ -609,28 +650,84 @@ def main(config_, save_path, args):
                                             param_name = target_parts[-1]
                                             if hasattr(target_module, param_name):
                                                 target_param = getattr(target_module, param_name)
-                                                target_param.data.copy_(fused_weight)
+                                                
+                                                # 复制并添加噪声
+                                                copied_weight = orig_weight.clone()
+                                                noise = torch.randn_like(copied_weight) * noise_std
+                                                target_param.data.copy_(copied_weight + noise)
+                                
+                                else:
+                                    # 超出原专家数量，使用专家融合
+                                    expert1_idx = torch.randint(0, 16, (1,)).item()
+                                    expert2_idx = torch.randint(0, 16, (1,)).item()
+                                    
+                                    # 随机插值权重
+                                    alpha = torch.rand(1).item() * 0.6 + 0.2  # 0.2-0.8之间
+                                    beta = 1.0 - alpha
+                                    
+                                    # 融合两个专家的权重
+                                    for orig_key, orig_weight in original_experts.items():
+                                        if f'experts.{expert1_idx}.' in orig_key:
+                                            # 找到对应的第二个专家权重
+                                            expert2_key = orig_key.replace(f'experts.{expert1_idx}.', f'experts.{expert2_idx}.')
+                                            if expert2_key in original_experts:
+                                                expert2_weight = original_experts[expert2_key]
+                                                
+                                                # 线性插值
+                                                fused_weight = alpha * orig_weight + beta * expert2_weight
+                                                
+                                                # 设置到目标专家
+                                                target_key = orig_key.replace(f'experts.{expert1_idx}.', '')
+                                                target_parts = target_key.split('.')
+                                                target_module = expert
+                                                for part in target_parts[:-1]:
+                                                    target_module = getattr(target_module, part)
+                                                
+                                                param_name = target_parts[-1]
+                                                if hasattr(target_module, param_name):
+                                                    target_param = getattr(target_module, param_name)
+                                                    target_param.data.copy_(fused_weight)
                         
                         # 初始化组内门控网络
-                        group_gate = mlp_module.expert_gates[group_idx]
-                        
-                        # 使用小的随机权重初始化门控网络
-                        if hasattr(group_gate, 'weight'):
-                            nn.init.normal_(group_gate.weight, mean=0.0, std=0.01)
-                        if hasattr(group_gate, 'bias') and group_gate.bias is not None:
-                            nn.init.constant_(group_gate.bias, 0.0)
+                        if group_idx < len(mlp_module.expert_gates):
+                            group_gate = mlp_module.expert_gates[group_idx]
+                            
+                            # 使用小的随机权重初始化门控网络
+                            if hasattr(group_gate, 'weight'):
+                                torch.nn.init.normal_(group_gate.weight, mean=0.0, std=0.01)
+                            if hasattr(group_gate, 'bias') and group_gate.bias is not None:
+                                torch.nn.init.constant_(group_gate.bias, 0.0)
                     
                     # 初始化第一级门控网络（专家组选择）
                     if hasattr(mlp_module, 'group_gate'):
-                        nn.init.normal_(mlp_module.group_gate.weight, mean=0.0, std=0.01)
+                        torch.nn.init.normal_(mlp_module.group_gate.weight, mean=0.0, std=0.01)
                         if mlp_module.group_gate.bias is not None:
-                            nn.init.constant_(mlp_module.group_gate.bias, 0.0)
+                            torch.nn.init.constant_(mlp_module.group_gate.bias, 0.0)
+        
+        # 冻结第一个专家组的权重（原始专家）
+        if local_rank == 0:
+            log("冻结第一个专家组的权重（原始1.5B专家）...")
+        
+        frozen_params = 0
+        for layer_name in hierarchical_moe_layers:
+            layer_module = dict(model.named_modules())[layer_name]
+            if hasattr(layer_module, 'mlp') and hasattr(layer_module.mlp, 'expert_groups'):
+                mlp_module = layer_module.mlp
+                
+                # 冻结第一个专家组的所有参数
+                if len(mlp_module.expert_groups) > 0:
+                    first_expert_group = mlp_module.expert_groups[0]
+                    for expert in first_expert_group:
+                        for param in expert.parameters():
+                            param.requires_grad = False
+                            frozen_params += param.numel()
         
         if local_rank == 0:
+            log(f"已冻结 {frozen_params:,} 个原始专家参数")
             log("分层MoE权重初始化完成")
     
     # 调用权重初始化函数
-    if config['model']['name'] == 'sam_hierarchical_moe_10b':
+    if config['model']['name'] == 'sam_hierarchical_moe_10b' or 'hierarchical_moe' in config['model']['name']:
         initialize_hierarchical_moe_from_1_5b(model, sam_checkpoint)
 
     print_model_parameters(model)
@@ -661,11 +758,21 @@ def main(config_, save_path, args):
     epoch_save = config.get('epoch_save')
     max_val_v = -1e18 if config['eval_type'] != 'ber' else 1e8
     timer = utils.Timer()
+    # 在首次训练前记录显存使用
+    if local_rank == 0:
+        log_gpu_memory("before training start")
+    
     for epoch in range(epoch_start, epoch_max + 1):
-        train_loader.sampler.set_epoch(epoch)
+        if train_loader is not None and hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
+            train_loader.sampler.set_epoch(epoch)
         t_epoch_start = timer.t()
-        train_loss_G = train(train_loader, model)
+        train_loss_G = train(train_loader, model, scaler)
         lr_scheduler.step()
+        
+        # 每个epoch后清理显存并记录
+        torch.cuda.empty_cache()
+        if epoch == epoch_start and local_rank == 0:
+            log_gpu_memory(f"after first epoch {epoch}")
 
         if local_rank == 0:
             log_info = [

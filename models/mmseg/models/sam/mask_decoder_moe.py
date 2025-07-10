@@ -12,6 +12,7 @@ from typing import List, Tuple, Type
 
 from .common import LayerNorm2d
 import math
+import warnings
 
 
 def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
@@ -240,6 +241,12 @@ class MaskDecoder(nn.Module):
         output_tokens = output_tokens.unsqueeze(0).expand(
             sparse_prompt_embeddings.size(0), -1, -1
         )  # (1,5,256)
+        
+        # 确保tokens的数据类型与embedding权重一致
+        target_dtype = self.iou_token.weight.dtype
+        output_tokens = output_tokens.to(target_dtype)
+        sparse_prompt_embeddings = sparse_prompt_embeddings.to(target_dtype)
+        
         tokens = torch.cat(
             (output_tokens, sparse_prompt_embeddings), dim=1
         )  # (1,5,256)
@@ -256,6 +263,14 @@ class MaskDecoder(nn.Module):
         b, c, h, w = src.shape  # 1,256,64,64
         src_feature = src
 
+        # 确保传入transformer的tensor数据类型一致
+        # 从transformer的第一层获取目标数据类型
+        if hasattr(self.transformer, 'layers') and len(self.transformer.layers) > 0:
+            target_dtype = next(self.transformer.layers[0].parameters()).dtype
+            src = src.to(target_dtype)
+            pos_src = pos_src.to(target_dtype)
+            tokens = tokens.to(target_dtype)
+        
         # Run the transformer
         hs, src = self.transformer(
             src, pos_src, tokens
@@ -321,6 +336,11 @@ class MLP(nn.Module):
         self.sigmoid_output = sigmoid_output
 
     def forward(self, x):
+        # 确保输入tensor与第一层权重的数据类型一致
+        if len(self.layers) > 0:
+            target_dtype = self.layers[0].weight.dtype
+            x = x.to(target_dtype)
+        
         for i, layer in enumerate(self.layers):
             x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         if self.sigmoid_output:

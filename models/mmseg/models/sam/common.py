@@ -9,6 +9,9 @@ import torch.nn.functional as F
 
 from typing import Type
 import loralib as lora
+from torch.utils.checkpoint import checkpoint
+
+
 class MoEMLPBlock(nn.Module):
     def __init__(
         self,
@@ -115,6 +118,7 @@ class HierarchicalMoEMLPBlock(nn.Module):
     分层MoE结构：
     - 第一级Router：将token分发到不同的专家组
     - 第二级Router：在选定的专家组内选择具体的专家
+    优化版本：使用批量处理而不是逐token处理，大幅提升性能
     """
     def __init__(
         self,
@@ -178,58 +182,91 @@ class HierarchicalMoEMLPBlock(nn.Module):
         return top_k_gates, top_k_indices
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """优化的批量处理版本，避免逐token循环"""
         original_shape = x.shape
-        x_flat = x.reshape(-1, self.embedding_dim)
+        x_flat = x.reshape(-1, self.embedding_dim)  # [batch_size, embedding_dim]
         batch_size = x_flat.shape[0]
         
-        # 第一级路由：选择专家组
+        # 第一级路由：选择专家组（批量处理）
         group_gates, group_indices = self._noisy_top_k_gating(
             x_flat, self.group_gate, self.k_groups
-        )
+        )  # group_gates: [batch_size, k_groups], group_indices: [batch_size, k_groups]
         
         final_output = torch.zeros_like(x_flat)
         
-        # 对每个选中的专家组进行处理
+        # 批量处理：按专家组和专家组合进行分组处理
         for group_k_idx in range(self.k_groups):
-            # 找出使用当前专家组的token
-            group_mask = torch.arange(batch_size, device=x_flat.device).unsqueeze(1) == \
-                        torch.arange(batch_size, device=x_flat.device).unsqueeze(0)
-            group_mask = group_mask[:, 0]  # 简化为所有token都考虑所有组
-            
-            # 获取每个token对应的专家组
-            for token_idx in range(batch_size):
-                selected_group_idx = group_indices[token_idx, group_k_idx].item()
-                group_weight = group_gates[token_idx, group_k_idx]
-                
-                if group_weight < 1e-6:  # 跳过权重过小的
+            for group_idx in range(self.num_expert_groups):
+                # 找出选择了当前专家组的所有token
+                group_mask = (group_indices[:, group_k_idx] == group_idx)
+                if not group_mask.any():
                     continue
                 
-                # 获取选定的专家组和门控
-                selected_experts = self.expert_groups[selected_group_idx]
-                selected_gate = self.expert_gates[selected_group_idx]
+                # 批量获取选择当前组的token
+                masked_tokens = x_flat[group_mask]  # [num_selected_tokens, embedding_dim]
+                masked_group_weights = group_gates[:, group_k_idx][group_mask]  # [num_selected_tokens]
                 
-                # 第二级路由：在组内选择专家
-                token_input = x_flat[token_idx:token_idx+1]  # [1, embedding_dim]
+                # 过滤权重过小的token
+                weight_mask = masked_group_weights >= 1e-6
+                if not weight_mask.any():
+                    continue
+                
+                filtered_tokens = masked_tokens[weight_mask]
+                filtered_group_weights = masked_group_weights[weight_mask]
+                
+                # 获取当前专家组
+                selected_experts = self.expert_groups[group_idx]
+                selected_gate = self.expert_gates[group_idx]
+                
+                # 第二级路由：在组内选择专家（批量处理）
                 expert_gates, expert_indices = self._noisy_top_k_gating(
-                    token_input, selected_gate, self.k_experts
-                )
+                    filtered_tokens, selected_gate, self.k_experts
+                )  # [num_filtered_tokens, k_experts]
                 
-                # 在选定组内处理专家
-                group_output = torch.zeros_like(token_input)
+                # 批量处理每个专家
+                group_output = torch.zeros_like(filtered_tokens)
                 for expert_k_idx in range(self.k_experts):
-                    expert_idx = expert_indices[0, expert_k_idx].item()
-                    expert_weight = expert_gates[0, expert_k_idx]
-                    
-                    if expert_weight < 1e-6:
-                        continue
-                    
-                    # 通过选定的专家
-                    selected_expert = selected_experts[expert_idx]
-                    expert_output = selected_expert(token_input)
-                    group_output += expert_weight * expert_output
+                    for expert_idx in range(self.experts_per_group):
+                        # 找出选择了当前专家的所有token
+                        expert_mask = (expert_indices[:, expert_k_idx] == expert_idx)
+                        if not expert_mask.any():
+                            continue
+                        
+                        # 批量处理选择当前专家的token
+                        expert_tokens = filtered_tokens[expert_mask]
+                        expert_weights = expert_gates[:, expert_k_idx][expert_mask]
+                        
+                        # 过滤权重过小的
+                        expert_weight_mask = expert_weights >= 1e-6
+                        if not expert_weight_mask.any():
+                            continue
+                        
+                        final_expert_tokens = expert_tokens[expert_weight_mask]
+                        final_expert_weights = expert_weights[expert_weight_mask]
+                        
+                        # 批量通过专家网络
+                        selected_expert = selected_experts[expert_idx]
+                        
+                        # 使用梯度检查点减少显存占用
+                        if self.training:
+                            expert_output = checkpoint(selected_expert, final_expert_tokens, use_reentrant=False)
+                        else:
+                            expert_output = selected_expert(final_expert_tokens)
+                            
+                        expert_output = expert_output * final_expert_weights.unsqueeze(-1)
+                        
+                        # 将结果累加回去
+                        cumulative_mask = expert_mask.clone()
+                        cumulative_mask[expert_mask] = expert_weight_mask
+                        group_output[cumulative_mask] += expert_output
                 
-                # 累加到最终输出，应用组权重
-                final_output[token_idx:token_idx+1] += group_weight * group_output
+                # 应用组权重并累加到最终输出
+                group_output = group_output * filtered_group_weights.unsqueeze(-1)
+                
+                # 将结果映射回原始位置
+                cumulative_mask = group_mask.clone() 
+                cumulative_mask[group_mask] = weight_mask
+                final_output[cumulative_mask] += group_output
         
         return final_output.reshape(original_shape)
 

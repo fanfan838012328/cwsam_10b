@@ -24,15 +24,7 @@ import os
 
 
 
-TORCH_MAJOR = int(torch.__version__.split('.')[0])
-TORCH_MINOR = int(torch.__version__.split('.')[1])
-if TORCH_MAJOR == 1 and TORCH_MINOR < 8:
-    try:
-        from torch._six import container_abcs
-    except ImportError:
-        import collections.abc as container_abcs
-else:
-    import collections.abc as container_abcs
+import collections.abc as container_abcs
 
 # This class and its supporting functions below lightly adapted from the ViTDet backbone available at: https://github.com/facebookresearch/detectron2/blob/main/detectron2/modeling/backbone/vit.py # noqa
 class ImageEncoderViT(nn.Module):
@@ -174,14 +166,11 @@ class ImageEncoderViT(nn.Module):
 
         ################ adaptor
         B, H, W = x.shape[0], x.shape[1], x.shape[2]  #1,64,64
-        outs = []
         # 遍历blocks
         for i, blk in enumerate(self.blocks):
             # 为每一个Transformer层生成特定的prompt
             x = prompt[i].reshape(B, H, W, -1) + x
             x = blk(x)  #[1,64,64,768]
-            if i in self.out_indices:
-                outs.append(x)
         ######################### adaptor end 
         # neck特征融合层
         x = self.neck(x.permute(0, 3, 1, 2))  #[1,256,64,64]
@@ -336,148 +325,56 @@ class PromptGenerator(nn.Module):
         N, C, H, W = handcrafted_feature.shape
         handcrafted_feature = handcrafted_feature.view(N, C, H*W).permute(0, 2, 1) #[1,4096,24]
         prompts = []
+        combined_feature = handcrafted_feature + embedding_feature
         for i in range(self.depth):
             lightweight_mlp = getattr(self, 'lightweight_mlp_{}'.format(str(i)))
             # prompt = proj_prompt(prompt)
-            prompt = lightweight_mlp(handcrafted_feature + embedding_feature) #[1,4096,24]
+            prompt = lightweight_mlp(combined_feature) #[1,4096,24]
             prompts.append(self.shared_mlp(prompt))  
             #prompts.append(prompt)
         return prompts #12*[1,4096,768]
 
-    def forward(self, x):
-        if self.input_type == 'laplacian':
-            pyr_A = self.lap_pyramid.pyramid_decom(img=x, num=self.freq_nums)
-            x = pyr_A[:-1]
-            laplacian = x[0]
-            for x_i in x[1:]:
-                x_i = F.interpolate(x_i, size=(laplacian.size(2), laplacian.size(3)), mode='bilinear', align_corners=True)
-                laplacian = torch.cat([laplacian, x_i], dim=1)
-            x = laplacian
-        elif self.input_type == 'fft':
-            x = self.fft(x, self.freq_nums)
-        elif self.input_type == 'all':
-            x = self.prompt.unsqueeze(0).repeat(x.shape[0], 1, 1, 1)
-
-        # get prompting
-        prompt = self.prompt_generator(x)
-
-        if self.mode == 'input':
-            prompt = self.proj(prompt)
-            return prompt
-        elif self.mode == 'stack':
-            prompts = []
-            for i in range(self.depth):
-                proj = getattr(self, 'proj_{}'.format(str(i)))
-                prompts.append(proj(prompt))
-            return prompts
-        elif self.mode == 'hierarchical':
-            prompts = []
-            for i in range(self.depth):
-                proj_prompt = getattr(self, 'proj_prompt_{}'.format(str(i)))
-                prompt = proj_prompt(prompt)
-                prompts.append(self.proj_token(prompt))
-            return prompts
-
-
     def fft(self, x_orig: torch.Tensor, rate: float) -> torch.Tensor:
+        """简化的FFT实现，提升性能，支持fp16"""
         original_dtype = x_orig.dtype
         
-        # 预先检查输入
-        if torch.isnan(x_orig).any() or torch.isinf(x_orig).any():
-            print(f"警告：输入张量包含NaN或Inf值 - 尝试修复")
-            # 替换NaN和Inf值为0
-            x_tmp = x_orig.clone()
-            x_tmp = torch.nan_to_num(x_tmp, nan=0.0, posinf=0.0, neginf=0.0)
-            x_orig = x_tmp
-            
-        # 保证rate是合理值
+        # 确保rate在合理范围内
         rate = max(0.01, min(0.99, rate))
         
+        # 如果输入是fp16，转换为float32进行FFT计算以提高数值稳定性
+        if original_dtype == torch.float16:
+            x = x_orig.float()
+        else:
+            x = x_orig
+        
+        # 创建低通滤波掩码
+        mask = torch.zeros(x.shape, dtype=x.dtype, device=x.device)
+        w, h = x.shape[-2:]
+        line = max(1, int((w * h * rate) ** .5 // 2))
+        mask[:, :, w//2-line:w//2+line, h//2-line:h//2+line] = 1
+        
         try:
-            # 兼容不同版本的PyTorch autocast导入
-            try:
-                with torch.cuda.amp.autocast(enabled=False):
-                    pass
-                autocast_context = torch.cuda.amp.autocast(enabled=False)
-            except AttributeError:
-                autocast_context = torch.autocast(device_type='cuda', enabled=False)
+            # 执行FFT
+            fft = torch.fft.fftshift(torch.fft.fft2(x, norm="forward"))
             
-            with autocast_context:
-                x = x_orig.float()  # 转换为float32以提高FFT操作的稳定性
-                
-                # 预处理：确保输入值在合理范围内
-                if x.min() < -1e6 or x.max() > 1e6:
-                    print(f"警告：输入值范围异常 min={x.min()}, max={x.max()}, 正在裁剪")
-                    x = torch.clamp(x, -1e6, 1e6)  # 防止极端值
-                    
-                # 创建掩码
-                mask = torch.zeros(x.shape, dtype=x.dtype, device=x.device)
-                w, h = x.shape[-2:]
-                line = max(1, int((w * h * rate) ** .5 // 2))  # 确保line至少为1
-                mask[:, :, w//2-line:w//2+line, h//2-line:h//2+line] = 1
-                
-                # 执行FFT，添加异常处理
-                try:
-                    fft = torch.fft.fftshift(torch.fft.fft2(x, norm="forward"))
-                except RuntimeError as e:
-                    print(f"FFT操作失败：{e}")
-                    # 返回一个全零张量作为后备
-                    return torch.zeros_like(x_orig)
-                
-                # 检查FFT结果
-                if torch.isnan(fft).any() or torch.isinf(fft).any():
-                    print(f"FFT结果包含NaN或Inf - 输入统计: min={x.min().item()}, max={x.max().item()}, mean={x.mean().item()}")
-                    # 返回一个全零张量
-                    return torch.zeros_like(x_orig)
-                
-                # 低通滤波
-                fft_low = fft * mask
-                fr_low = fft_low.real
-                fi_low = fft_low.imag
-                
-                # 检查数值稳定性
-                if torch.isnan(fr_low).any() or torch.isnan(fi_low).any():
-                    print("低频实部或虚部包含NaN")
-                    return torch.zeros_like(x_orig)
-                
-                fft_hires_low = torch.fft.ifftshift(torch.complex(fr_low, fi_low))
-                
-                # 逆FFT
-                try:
-                    inv_low_complex = torch.fft.ifft2(fft_hires_low, norm="forward")
-                    inv_low = inv_low_complex.real
-                except RuntimeError as e:
-                    print(f"逆FFT操作失败：{e}")
-                    return torch.zeros_like(x_orig)
-                
-                # 检查逆FFT结果
-                if torch.isnan(inv_low).any() or torch.isinf(inv_low).any():
-                    print(f"逆FFT结果包含NaN - fft_hires_low统计: min={fft_hires_low.abs().min().item()}, max={fft_hires_low.abs().max().item()}")
-                    return torch.zeros_like(x_orig)
-                
-                # 取绝对值
-                inv_low = torch.abs(inv_low)
-                
-                # 最终检查
-                if torch.isnan(inv_low).any() or torch.isinf(inv_low).any():
-                    print("绝对值操作后出现NaN")
-                    return torch.zeros_like(x_orig)
-                
-                # 返回处理后的结果，转换回原始数据类型
-                processed_output = inv_low
-                
-        except Exception as e:
-            print(f"FFT处理中发生异常: {e}")
-            # 出现任何异常，返回零张量
+            # 低通滤波
+            fft_low = fft * mask
+            
+            # 逆FFT
+            fft_hires_low = torch.fft.ifftshift(fft_low)
+            inv_low = torch.fft.ifft2(fft_hires_low, norm="forward").real
+            
+            # 取绝对值并转换回原始数据类型
+            result = torch.abs(inv_low)
+            
+            # 如果原始数据是fp16，转换回fp16
+            if original_dtype == torch.float16:
+                result = result.half()
+            
+            return result
+        except:
+            # 如果FFT失败，返回零张量
             return torch.zeros_like(x_orig)
-            
-        # 最后的安全检查
-        result = processed_output.to(original_dtype)
-        if torch.isnan(result).any() or torch.isinf(result).any():
-            print("返回前检测到NaN，使用零张量替代")
-            return torch.zeros_like(x_orig)
-            
-        return result
 
 class PatchEmbed2(nn.Module):
     """ Image to Patch Embedding
@@ -998,14 +895,18 @@ class ImageEncoderViT_hierarchical_moe(nn.Module):
             x = x + self.pos_embed
 
         B, H, W = x.shape[0], x.shape[1], x.shape[2]  #1,64,64
-        outs = []
         # 遍历blocks
         for i, blk in enumerate(self.blocks):
             # 为每一个Transformer层生成特定的prompt
             x = prompt[i].reshape(B, H, W, -1) + x
-            x = blk(x)  #[1,64,64,768]
-            if i in self.out_indices:
-                outs.append(x)
+            
+            # 使用梯度检查点节省显存（如果启用且在训练状态）
+            if hasattr(blk, 'use_checkpoint') and blk.use_checkpoint and self.training:
+                # 使用梯度检查点
+                from torch.utils.checkpoint import checkpoint
+                x = checkpoint(blk, x, use_reentrant=False)
+            else:
+                x = blk(x)  #[1,64,64,768]
                 
         # neck特征融合层
         x = self.neck(x.permute(0, 3, 1, 2))  #[1,256,64,64]

@@ -104,7 +104,7 @@ data_norm:
     div:
     - 0.5
 model:
-  name: sam_bf16_10b
+  name: sam_hierarchical_moe_10b
   args:
     num_classes: 33
     inp_size: 512
@@ -136,7 +136,14 @@ model:
       - 15
       - 23
       - 31
-      # MoE相关设置
+      # 分层MoE相关设置
+      moe_num_expert_groups: 6    # 专家组数量
+      moe_experts_per_group: 16   # 每组内的专家数量
+      moe_k_groups: 2             # 选择的专家组数量
+      moe_k_experts: 4            # 每组内选择的专家数量
+      moe_noisy_gating: true      # 是否使用噪声门控
+      moe_start_layer_index: 24   # 从第24层开始应用分层MoE
+      # 原有MoE设置（可能不再需要）
       moe_num_experts: 1412  # 专家数量，较少以减少显存
       moe_k: 1  # 选择的专家数量
       moe_noisy_gating: true  # 使用噪声门控
