@@ -422,19 +422,29 @@ class SAM_HIERARCHICAL_MOE_10B(nn.Module):
         
         self.prompt_embed_dim = encoder_mode['prompt_embed_dim']
         
+        # 定义解码器和Transformer的MoE参数
+        decoder_moe_num_experts = encoder_mode.get('decoder_moe_num_experts', 128)
+        decoder_moe_k = encoder_mode.get('decoder_moe_k', 2)
+        transformer_moe_num_experts = encoder_mode.get('transformer_moe_num_experts', 128)
+        transformer_moe_k = encoder_mode.get('transformer_moe_k', 2)
+
         # 使用MoE的Mask Decoder
         self.mask_decoder = MaskDecoder_moe(
             num_multimask_outputs=3,
             transformer=TwoWayTransformer_moe(
-                depth=2,
+                depth=4,
                 embedding_dim=self.prompt_embed_dim,
                 mlp_dim=2048,
                 num_heads=8,
+                moe_num_experts=transformer_moe_num_experts,
+                moe_k=transformer_moe_k,
             ),
             transformer_dim=self.prompt_embed_dim,
             iou_head_depth=3,
             iou_head_hidden_dim=256,
             num_classes=num_classes,
+            moe_num_experts=decoder_moe_num_experts,
+            moe_k=decoder_moe_k,
         )
 
         if 'evp' in encoder_mode['name']:

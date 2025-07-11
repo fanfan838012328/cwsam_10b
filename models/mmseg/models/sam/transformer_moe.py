@@ -22,6 +22,10 @@ class TwoWayTransformer(nn.Module):
         mlp_dim: int,
         activation: Type[nn.Module] = nn.ReLU,
         attention_downsample_rate: int = 2,
+        # MoE parameters
+        moe_num_experts: int = 32,
+        moe_k: int = 2,
+        moe_noisy_gating: bool = True,
     ) -> None:
         """
         A transformer decoder that attends to an input image using
@@ -51,6 +55,9 @@ class TwoWayTransformer(nn.Module):
                     activation=activation,
                     attention_downsample_rate=attention_downsample_rate,
                     skip_first_layer_pe=(i == 0),
+                    moe_num_experts=moe_num_experts,
+                    moe_k=moe_k,
+                    moe_noisy_gating=moe_noisy_gating,
                 )
             )
 
@@ -115,6 +122,10 @@ class TwoWayAttentionBlock(nn.Module):
         activation: Type[nn.Module] = nn.ReLU,
         attention_downsample_rate: int = 2,
         skip_first_layer_pe: bool = False,
+        # MoE parameters
+        moe_num_experts: int = 32,
+        moe_k: int = 2,
+        moe_noisy_gating: bool = True,
     ) -> None:
         """
         A transformer block with four layers: (1) self-attention of sparse
@@ -140,12 +151,12 @@ class TwoWayAttentionBlock(nn.Module):
 
         # self.mlp = MLPBlock(embedding_dim, mlp_dim, activation)
         self.mlp = MoEMLPBlock(
-            embedding_dim=embedding_dim, 
+            embedding_dim=embedding_dim,
             mlp_dim=mlp_dim,
             act=activation,
-            num_experts=16,
-            k=2,
-            noisy_gating=True
+            num_experts=moe_num_experts,
+            k=moe_k,
+            noisy_gating=moe_noisy_gating,
         )
         self.norm3 = nn.LayerNorm(embedding_dim)
 

@@ -103,7 +103,7 @@ def make_data_loader(spec, tag=''):
         batch_size=spec['batch_size'],
         shuffle=False,
         num_workers=4,
-        pin_memory=False,
+        pin_memory=True,  # 推荐在多卡训练中开启以加速数据传输
         sampler=sampler,
     )
     return loader
@@ -115,17 +115,12 @@ def make_data_loaders():
     return train_loader, val_loader
 
 def eval_psnr(loader, model, config):
-    # 只有rank 0 (主GPU)进行验证
-    if local_rank != 0:
-        # 非主GPU返回占位值
-        dummy_table = None
-        dummy_matrix = None
-        return 0, 0, 0, 0, 'none', 'none', 'none', 'none', dummy_table, dummy_matrix
-    
     model.eval()
     eval_type = config.get('eval_type')
     class_num = config['model']['args']['num_classes']
     ignore_background = config['val_dataset']['dataset']['args']['ignore_bg']
+    
+    # 初始化指标计算器
     if eval_type == 'f1':
         metric_fn = utils.calc_f1
         metric1, metric2, metric3, metric4 = 'f1', 'auc', 'none', 'none'
@@ -141,7 +136,6 @@ def eval_psnr(loader, model, config):
     elif eval_type == 'seg':
         metric_fn = utils.calc_cod
         metric1, metric2, metric3, metric4 = 'sm', 'em', 'wfm', 'mae'
-        
         metric_seg = SegmentationMetric(class_num, ignore_background)
 
     val_metric1 = utils.Averager()
@@ -149,186 +143,111 @@ def eval_psnr(loader, model, config):
     val_metric3 = utils.Averager()
     val_metric4 = utils.Averager()
 
-    # 显示进度条
-    pbar = tqdm(total=len(loader), leave=False, desc='val')
-    
-    # 设备配置
-    device = torch.device(f"cuda:{local_rank}")
-    
-    # 批量处理结果，避免频繁的CPU转换和内存占用
-    batch_count = 0
-    # 较大的批处理大小，因为现在只用一个GPU处理
-    batch_limit = 8
-    
-    if eval_type == 'seg':
-        # 准备标签缓存
-        mask_labels = []
-        gt_labels = []
-    
+    if local_rank == 0:
+        pbar = tqdm(total=len(loader), leave=False, desc='val')
+    else:
+        pbar = None
+
     for batch in loader:
-        batch_count += 1
-        
         for k, v in batch.items():
-            # 不再强制转换输入为fp16，让autocast自动管理精度
             batch[k] = v.to(device)
 
-        inp = batch['inp']
-
         with torch.no_grad():
-            # 使用autocast进行混合精度推理
-            output_masks = model.infer(inp)
+            output_masks = model.infer(batch['inp'])
             pred = torch.sigmoid(output_masks)
         
-        # 计算当前批次的指标
         result1, result2, result3, result4 = metric_fn(pred, batch['gt'])
-        val_metric1.add(result1.item(), inp.shape[0])
-        val_metric2.add(result2.item(), inp.shape[0])
-        val_metric3.add(result3.item(), inp.shape[0])
-        val_metric4.add(result4.item(), inp.shape[0])
+        val_metric1.add(result1.item(), batch['inp'].shape[0])
+        val_metric2.add(result2.item(), batch['inp'].shape[0])
+        val_metric3.add(result3.item(), batch['inp'].shape[0])
+        val_metric4.add(result4.item(), batch['inp'].shape[0])
         
         if eval_type == 'seg':
-            # 处理分割数据
             for b in range(pred.shape[0]):
-                output_mask = pred[b]
-                gt_mask = batch['gt'][b]
-                
-                # 在GPU上进行处理
-                mask_index = torch.argmax(output_mask, dim=0).flatten()
-                gt_index = torch.argmax(gt_mask, dim=0).flatten()
-                
-                # 收集标签
-                mask_labels.append(mask_index)
-                gt_labels.append(gt_index)
-            
-            # 定期处理收集的标签以减少内存使用
-            if len(mask_labels) >= batch_limit * inp.shape[0] or batch_count == len(loader):
-                # 批量更新指标
-                if mask_labels:
-                    # 将标签转到CPU进行处理
-                    for i in range(len(mask_labels)):
-                        mask_cpu = mask_labels[i].cpu().numpy()
-                        gt_cpu = gt_labels[i].cpu().numpy()
-                        metric_seg.addBatch(mask_cpu, gt_cpu)
-                    
-                    # 清空缓存以释放GPU内存
-                    mask_labels = []
-                    gt_labels = []
+                mask_index = torch.argmax(pred[b], dim=0).cpu().numpy()
+                gt_index = torch.argmax(batch['gt'][b], dim=0).cpu().numpy()
+                metric_seg.addBatch(mask_index, gt_index)
         
-        # 更新进度条
-        pbar.update(1)
+        if pbar is not None:
+            pbar.update(1)
 
-    pbar.close()
+    if pbar is not None:
+        pbar.close()
 
-    # 计算最终指标
+    # --- 分布式聚合 ---
     if eval_type == 'seg':
-        oa = metric_seg.overallAccuracy()
-        oa = np.around(oa, decimals=4)
-        mIoU, IoU = metric_seg.meanIntersectionOverUnion()
-        mIoU = np.around(mIoU, decimals=4)
-        IoU = np.around(IoU, decimals=4)
-        
-        # 处理可能出现的除零情况
-        p = np.diag(metric_seg.confusionMatrix) / (metric_seg.confusionMatrix.sum(axis=0) + 1e-10)
-        p = np.around(p, decimals=4)
-        mp = np.nanmean(p)
-        mp = np.around(mp, decimals=4)
-        
-        r = np.diag(metric_seg.confusionMatrix) / (metric_seg.confusionMatrix.sum(axis=1) + 1e-10)
-        r = np.around(r, decimals=4)
-        mr = np.nanmean(r)
-        mr = np.around(mr, decimals=4)
-        
-        # 处理F1计算中的除零情况
-        f1 = np.zeros_like(p)
-        valid_mask = (p + r) > 0
-        f1[valid_mask] = (2 * p[valid_mask] * r[valid_mask]) / (p[valid_mask] + r[valid_mask])
-        f1 = np.around(f1, decimals=4)
-        mf1 = np.nanmean(f1)
-        mf1 = np.around(mf1, decimals=4)
-        
-        # 处理混淆矩阵归一化
-        row_sums = metric_seg.confusionMatrix.sum(axis=0)
-        valid_rows = row_sums > 0
-        normed_confusionMatrix = np.zeros_like(metric_seg.confusionMatrix, dtype=float)
-        normed_confusionMatrix[:, valid_rows] = metric_seg.confusionMatrix[:, valid_rows] / (row_sums[valid_rows] + 1e-10)
-        normed_confusionMatrix = np.around(normed_confusionMatrix, decimals=3)
-        
-        fwIOU = metric_seg.Frequency_Weighted_Intersection_over_Union()
-        fwIOU = np.around(fwIOU, decimals=4)
-        
-        classes_list = config['train_dataset']['dataset']['args']['classes']
-        if ignore_background:
-            axis_labels = classes_list[:-1] 
-        else: 
-            axis_labels = classes_list
-        
-        # 确保所有行的长度一致
-        title_row = ['metrics', 'average']
-        title_row.extend(axis_labels)
-        
-        # 创建表格
-        table = PrettyTable(title_row)
-        
-        # 确保每行的长度与title_row一致
-        IOU_row = ['IOU', mIoU]
-        IOU_row.extend(IoU.tolist())
-        # 检查并调整行长度
-        if len(IOU_row) > len(title_row):
-            IOU_row = IOU_row[:len(title_row)]  # 截断过长的行
-        while len(IOU_row) < len(title_row):
-            IOU_row.append(' ')  # 填充过短的行
-            
-        Precision_row = ['Precision', mp]
-        Precision_row.extend(p.tolist())
-        # 检查并调整行长度
-        if len(Precision_row) > len(title_row):
-            Precision_row = Precision_row[:len(title_row)]
-        while len(Precision_row) < len(title_row):
-            Precision_row.append(' ')
-            
-        Recall_row = ['Recall', mr]
-        Recall_row.extend(r.tolist())
-        # 检查并调整行长度
-        if len(Recall_row) > len(title_row):
-            Recall_row = Recall_row[:len(title_row)]
-        while len(Recall_row) < len(title_row):
-            Recall_row.append(' ')
-            
-        F1_row = ['F1', mf1]
-        F1_row.extend(f1.tolist())
-        # 检查并调整行长度
-        if len(F1_row) > len(title_row):
-            F1_row = F1_row[:len(title_row)]
-        while len(F1_row) < len(title_row):
-            F1_row.append(' ')
-            
-        OA_row = ['OA', oa]
-        while len(OA_row) < len(title_row):
-            OA_row.append(' ')
-            
-        fwIOU_row = ['FWIOU', fwIOU]
-        while len(fwIOU_row) < len(title_row):
-            fwIOU_row.append(' ')
+        confusion_matrix_tensor = torch.from_numpy(metric_seg.confusionMatrix).to(device)
+        dist.all_reduce(confusion_matrix_tensor, op=dist.ReduceOp.SUM)
+        if local_rank == 0:
+            metric_seg.confusionMatrix = confusion_matrix_tensor.cpu().numpy()
 
-        table.add_row(IOU_row)
-        table.add_row(Precision_row)
-        table.add_row(Recall_row)
-        table.add_row(F1_row)
-        table.add_row(OA_row)
-        table.add_row(fwIOU_row)
-    else:
+    # 聚合 Averager 的数据
+    # 假设 Averager 有 .sum 和 .count 属性
+    metrics_data = torch.tensor([
+        val_metric1.sum, val_metric1.count,
+        val_metric2.sum, val_metric2.count,
+        val_metric3.sum, val_metric3.count,
+        val_metric4.sum, val_metric4.count,
+    ]).float().to(device)
+    dist.all_reduce(metrics_data, op=dist.ReduceOp.SUM)
+
+    # --- 在主进程计算并返回结果 ---
+    if local_rank == 0:
+        val_metric1_avg = (metrics_data[0] / metrics_data[1]).item() if metrics_data[1] > 0 else 0
+        val_metric2_avg = (metrics_data[2] / metrics_data[3]).item() if metrics_data[3] > 0 else 0
+        val_metric3_avg = (metrics_data[4] / metrics_data[5]).item() if metrics_data[5] > 0 else 0
+        val_metric4_avg = (metrics_data[6] / metrics_data[7]).item() if metrics_data[7] > 0 else 0
+        
         table = None
         normed_confusionMatrix = None
+        if eval_type == 'seg':
+            oa = metric_seg.overallAccuracy()
+            oa = np.around(oa, decimals=4)
+            mIoU, IoU = metric_seg.meanIntersectionOverUnion()
+            mIoU = np.around(mIoU, decimals=4)
+            IoU = np.around(IoU, decimals=4)
+            p = np.diag(metric_seg.confusionMatrix) / (metric_seg.confusionMatrix.sum(axis=0) + 1e-10)
+            p = np.around(p, decimals=4)
+            mp = np.nanmean(p)
+            mp = np.around(mp, decimals=4)
+            r = np.diag(metric_seg.confusionMatrix) / (metric_seg.confusionMatrix.sum(axis=1) + 1e-10)
+            r = np.around(r, decimals=4)
+            mr = np.nanmean(r)
+            mr = np.around(mr, decimals=4)
+            f1 = np.zeros_like(p)
+            valid_mask = (p + r) > 0
+            f1[valid_mask] = (2 * p[valid_mask] * r[valid_mask]) / (p[valid_mask] + r[valid_mask])
+            f1 = np.around(f1, decimals=4)
+            mf1 = np.nanmean(f1)
+            mf1 = np.around(mf1, decimals=4)
+            row_sums = metric_seg.confusionMatrix.sum(axis=0)
+            valid_rows = row_sums > 0
+            normed_confusionMatrix = np.zeros_like(metric_seg.confusionMatrix, dtype=float)
+            normed_confusionMatrix[:, valid_rows] = metric_seg.confusionMatrix[:, valid_rows] / (row_sums[valid_rows] + 1e-10)
+            normed_confusionMatrix = np.around(normed_confusionMatrix, decimals=3)
+            fwIOU = metric_seg.Frequency_Weighted_Intersection_over_Union()
+            fwIOU = np.around(fwIOU, decimals=4)
+            classes_list = config['train_dataset']['dataset']['args']['classes']
+            axis_labels = classes_list[:-1] if ignore_background else classes_list
+            title_row = ['metrics', 'average'] + axis_labels
+            table = PrettyTable(title_row)
+            
+            def create_row(name, avg_val, val_list):
+                row = [name, avg_val] + val_list.tolist()
+                return row[:len(title_row)] + [' '] * (len(title_row) - len(row))
 
-    val_metric1_avg = val_metric1.item()
-    val_metric2_avg = val_metric2.item()
-    val_metric3_avg = val_metric3.item()
-    val_metric4_avg = val_metric4.item()
-    
-    # 清理GPU内存
-    torch.cuda.empty_cache()
-    
-    return val_metric1_avg, val_metric2_avg, val_metric3_avg, val_metric4_avg, metric1, metric2, metric3, metric4, table, normed_confusionMatrix
+            table.add_row(create_row('IOU', mIoU, IoU))
+            table.add_row(create_row('Precision', mp, p))
+            table.add_row(create_row('Recall', mr, r))
+            table.add_row(create_row('F1', mf1, f1))
+            table.add_row(['OA', oa] + [''] * (len(title_row) - 2))
+            table.add_row(['FWIOU', fwIOU] + [''] * (len(title_row) - 2))
+        
+        torch.cuda.empty_cache()
+        return val_metric1_avg, val_metric2_avg, val_metric3_avg, val_metric4_avg, metric1, metric2, metric3, metric4, table, normed_confusionMatrix
+    else:
+        torch.cuda.empty_cache()
+        return 0, 0, 0, 0, 'none', 'none', 'none', 'none', None, None
 
 
 def log_gpu_memory(stage=""):
@@ -342,8 +261,8 @@ def prepare_training():
     model = models.make(config['model'])
     
     # 将模型移到GPU，但保持fp32参数以支持混合精度训练
-    model = model.cuda()
-    log_gpu_memory("after model.cuda()")
+    model = model.to(device)
+    log_gpu_memory("after model.to(device)")
     
     if local_rank == 0:
         log("Using mixed precision training (autocast) instead of model.half() for better gradient stability...")

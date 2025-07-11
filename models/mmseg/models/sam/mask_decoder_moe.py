@@ -7,10 +7,11 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch import Tensor
 
 from typing import List, Tuple, Type
 
-from .common import LayerNorm2d
+from .common import LayerNorm2d, MoEMLPBlock
 import math
 import warnings
 
@@ -84,7 +85,11 @@ class MaskDecoder(nn.Module):
         activation: Type[nn.Module] = nn.GELU,
         iou_head_depth: int = 3,
         iou_head_hidden_dim: int = 256,
-        num_classes: int = 1
+        num_classes: int = 1,
+        # MoE parameters
+        moe_num_experts: int = 32,
+        moe_k: int = 2,
+        moe_noisy_gating: bool = True,
     ) -> None:
         """
         Predicts masks given an image and prompt embeddings, using a
@@ -129,13 +134,31 @@ class MaskDecoder(nn.Module):
         )
         self.output_hypernetworks_mlps = nn.ModuleList(
             [
-                MLP(transformer_dim, transformer_dim, transformer_dim // 8, 3)
+                nn.Sequential(
+                    MoEMLPBlock(
+                        embedding_dim=transformer_dim,
+                        mlp_dim=transformer_dim,
+                        act=activation,
+                        num_experts=moe_num_experts,
+                        k=moe_k,
+                        noisy_gating=moe_noisy_gating,
+                    ),
+                    nn.Linear(transformer_dim, transformer_dim // 8),
+                )
                 for i in range(self.num_mask_tokens)
             ]
         )
 
-        self.iou_prediction_head = MLP(
-            transformer_dim, iou_head_hidden_dim, self.num_mask_tokens, iou_head_depth
+        self.iou_prediction_head = nn.Sequential(
+            MoEMLPBlock(
+                embedding_dim=transformer_dim,
+                mlp_dim=iou_head_hidden_dim,
+                act=activation,
+                num_experts=moe_num_experts,
+                k=moe_k,
+                noisy_gating=moe_noisy_gating,
+            ),
+            nn.Linear(transformer_dim, self.num_mask_tokens),
         )
 
         # self.output_upscaling_adaptor = nn.Sequential(
