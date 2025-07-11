@@ -258,29 +258,23 @@ def log_gpu_memory(stage=""):
         log(f"GPU Memory {stage}: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
 
 def prepare_training():
-    # 1. 在所有进程中同步创建模型，避免GPU0独占
     model = models.make(config['model'])
     
-    # 2. 使用更高效的DDP配置
+    # 将模型移到GPU，但保持fp32参数以支持混合精度训练
     model = model.to(device)
-    
-    # 3. 立即进行显存清理
-    torch.cuda.empty_cache()
     log_gpu_memory("after model.to(device)")
     
     if local_rank == 0:
         log("Using mixed precision training (autocast) instead of model.half() for better gradient stability...")
+    # 不再使用model.half()，而是使用autocast进行混合精度训练
     log_gpu_memory("after model setup")
     
-    # 4. 优化DDP配置以减少GPU0负载
     model = torch.nn.parallel.DistributedDataParallel(
         model,
         device_ids=[local_rank],
         output_device=local_rank,
-        find_unused_parameters=False,  # 改为False，减少内存开销
+        find_unused_parameters=True,
         broadcast_buffers=False,
-        bucket_cap_mb=25,  # 减少bucket大小，降低内存峰值
-        gradient_as_bucket_view=True,  # 减少梯度内存占用
     )
     log_gpu_memory("after DDP")
     
@@ -298,66 +292,40 @@ def prepare_training():
     scaler = GradScaler()
     log_gpu_memory("after scaler")
     
-    # 优化checkpoint加载机制，减少GPU0内存峰值
+    # 加载 checkpoint
     if config.get('resume') is not None:
         epoch_start = config.get('resume') + 1
         resume_model_path = os.path.join(
             config.get('work_dir'), 'model_epoch_' + str(config.get('resume')) + '.pth'
         )
         
-        # 使用map_location='cpu'减少GPU内存占用，然后分批传输
+        # 只在 rank 0 加载权重
         if local_rank == 0:
-            log(f'Loading checkpoint from {resume_model_path}')
-            checkpoint = torch.load(resume_model_path, map_location='cpu')
-        else:
-            checkpoint = None
+            checkpoint = torch.load(resume_model_path)
+            if local_rank == 0:
+                log(f'Loading checkpoint from {resume_model_path}')
         
-        # 等待所有进程同步
+        # 等待 rank 0 加载完成
         dist.barrier()
         
-        # 分批广播权重，避免GPU0内存峰值
-        model_state_dict = model.module.state_dict()
+        # 广播权重
         if local_rank == 0:
-            param_keys = list(checkpoint.keys())
+            for k, v in checkpoint.items():
+                v = v.cuda()
+                dist.broadcast(v, 0)
+                checkpoint[k] = v
         else:
-            param_keys = list(model_state_dict.keys())
+            checkpoint = {}
+            for k, _ in model.module.state_dict().items():
+                v = torch.empty_like(model.module.state_dict()[k]).cuda()
+                dist.broadcast(v, 0)
+                checkpoint[k] = v
         
-        # 分批处理权重，每次处理一部分参数
-        batch_size = 50  # 每批处理50个参数
-        for i in range(0, len(param_keys), batch_size):
-            batch_keys = param_keys[i:i+batch_size]
-            
-            if local_rank == 0:
-                # 只将当前批次的参数移到GPU
-                batch_params = {}
-                for key in batch_keys:
-                    if key in checkpoint and key in model_state_dict:
-                        if checkpoint[key].shape == model_state_dict[key].shape:
-                            batch_params[key] = checkpoint[key].cuda()
-            else:
-                batch_params = {}
-                for key in batch_keys:
-                    if key in model_state_dict:
-                        batch_params[key] = torch.empty_like(model_state_dict[key]).cuda()
-            
-            # 广播当前批次
-            for key in batch_keys:
-                if key in batch_params:
-                    dist.broadcast(batch_params[key], 0)
-            
-            # 立即加载到模型并清理临时变量
-            for key, param in batch_params.items():
-                if key in model_state_dict:
-                    model_state_dict[key].copy_(param)
-            
-            # 清理当前批次的GPU内存
-            del batch_params
-            torch.cuda.empty_cache()
+        # 加载权重到模型
+        model.module.load_state_dict(checkpoint, strict=False)
         
         if local_rank == 0:
             log('Resume training from epoch {}'.format(epoch_start))
-            # 清理checkpoint变量
-            del checkpoint
     else:
         epoch_start = 1
     
@@ -377,58 +345,22 @@ def train(train_loader, model, scaler):
         pbar = None
 
     loss_list = []
-    
-    # 添加梯度累积以减少内存峰值
-    accumulate_steps = config.get('grad_accum_steps', 1)
-    effective_batch_count = 0
-    
-    for batch_idx, batch in enumerate(train_loader):
-        # 使用非阻塞传输减少GPU等待时间
+    for batch in train_loader:
         for k, v in batch.items():
-            batch[k] = v.to(device, non_blocking=True)
-        
+            # 不再强制转换输入为fp16，让autocast自动管理精度
+            batch[k] = v.to(device)
         inp = batch['inp']
         gt = batch['gt']
         model.set_input(inp, gt)
+        # 设置scaler用于混合精度训练
         model.scaler = scaler
-        
-        # 前向传播
-        model.forward()
-        model.optimizer.zero_grad()
-        
-        # 缩放损失以实现梯度累积
-        scaled_loss = model.loss_G / accumulate_steps
-        
-        # 反向传播
-        if hasattr(model, 'scaler') and model.scaler is not None:
-            model.scaler.scale(scaled_loss).backward()
-        else:
-            scaled_loss.backward()
-        
-        effective_batch_count += 1
-        
-        # 当累积足够的梯度时才进行参数更新
-        if effective_batch_count % accumulate_steps == 0:
-            if hasattr(model, 'scaler') and model.scaler is not None:
-                model.scaler.step(model.optimizer)
-                model.scaler.update()
-            else:
-                model.optimizer.step()
-        
-        # 收集损失，但减少通信频率
-        if batch_idx % max(1, len(train_loader) // 20) == 0:  # 每5%的batch收集一次
-            batch_loss_tensors = [
-                torch.zeros_like(model.loss_G) for _ in range(dist.get_world_size())
-            ]
-            dist.all_gather(batch_loss_tensors, model.loss_G)
-            loss_list.extend([loss.item() for loss in batch_loss_tensors])
-            
-            # 立即清理临时张量
-            del batch_loss_tensors
-        
-        # 定期清理缓存
-        if batch_idx % 50 == 0:
-            torch.cuda.empty_cache()
+        model.optimize_parameters()
+        batch_loss_tensors = [
+            torch.zeros_like(model.loss_G) for _ in range(dist.get_world_size())
+        ]
+        dist.all_gather(batch_loss_tensors, model.loss_G)
+        # 立即提取标量值，避免在列表中积累张量
+        loss_list.extend([loss.item() for loss in batch_loss_tensors])
 
         if pbar is not None:
             pbar.update(1)
@@ -436,18 +368,8 @@ def train(train_loader, model, scaler):
     if pbar is not None:
         pbar.close()
 
-    # 如果有剩余的累积梯度，进行最后一次更新
-    if effective_batch_count % accumulate_steps != 0:
-        if hasattr(model, 'scaler') and model.scaler is not None:
-            model.scaler.step(model.optimizer)
-            model.scaler.update()
-        else:
-            model.optimizer.step()
-
-    # 训练结束后进行一次彻底的内存清理
-    torch.cuda.empty_cache()
-    
-    return mean(loss_list) if loss_list else 0.0
+    # loss_list 现在已经包含标量，直接计算平均值
+    return mean(loss_list)
 
 
 # 在训练脚本中添加以下代码
@@ -495,77 +417,27 @@ def main(config_, save_path, args):
     # model已经在prepare_training()中处理过DDP并返回了unwrapped model
 
 
-    # 优化SAM权重加载，避免GPU0内存峰值
-    if local_rank == 0:
-        sam_checkpoint = torch.load(config['sam_checkpoint'], map_location='cpu')
-    else:
-        sam_checkpoint = None
-    
-    # 等待rank 0加载完成
-    dist.barrier()
+    sam_checkpoint = torch.load(config['sam_checkpoint'])
+    # 自定义加载权重的函数
 
-    def load_filtered_state_dict_distributed(model, state_dict):
+    def load_filtered_state_dict(model, state_dict):
         model_dict = model.state_dict()
-        
+        filtered_state_dict = {
+            k: v
+            for k, v in state_dict.items()
+            if k in model_dict and model_dict[k].shape == v.shape
+        }
+        model.load_state_dict(filtered_state_dict, strict=False)
+        unmatched_keys = {
+            k: v
+            for k, v in state_dict.items()
+            if k in model_dict and model_dict[k].shape != v.shape
+        }
         if local_rank == 0:
-            # 在CPU上预过滤权重，减少GPU传输量
-            filtered_keys = [
-                k for k in state_dict.keys()
-                if k in model_dict and model_dict[k].shape == state_dict[k].shape
-            ]
-            unmatched_keys = [
-                k for k in state_dict.keys()
-                if k in model_dict and model_dict[k].shape != state_dict[k].shape
-            ]
-            log(f"warning unmatched_keys: {unmatched_keys}")
-        else:
-            filtered_keys = []
-        
-        # 广播过滤后的键列表
-        filtered_keys_tensor = torch.tensor(len(filtered_keys) if local_rank == 0 else 0).cuda()
-        dist.broadcast(filtered_keys_tensor, 0)
-        
-        # 分批加载SAM权重，避免内存峰值
-        batch_size = 30  # SAM模型权重数量较多，使用较小的批次
-        for i in range(0, filtered_keys_tensor.item(), batch_size):
-            if local_rank == 0:
-                batch_keys = filtered_keys[i:i+batch_size]
-                batch_params = {k: state_dict[k].cuda() for k in batch_keys}
-            else:
-                batch_keys = []
-                batch_params = {}
-            
-            # 广播当前批次的键
-            for j, key in enumerate(batch_keys if local_rank == 0 else []):
-                # 广播参数
-                if local_rank == 0:
-                    param = batch_params[key]
-                else:
-                    if len(batch_keys) <= j:
-                        break
-                    param = torch.empty_like(model_dict[key]).cuda()
-                
-                dist.broadcast(param, 0)
-                
-                if local_rank != 0:
-                    batch_params[key] = param
-            
-            # 应用当前批次的权重
-            with torch.no_grad():
-                for key, param in batch_params.items():
-                    if key in model_dict:
-                        model_dict[key].copy_(param)
-            
-            # 清理当前批次
-            del batch_params
-            torch.cuda.empty_cache()
+            log(f"warning unmatched_keys: {unmatched_keys.keys()}")
 
-    load_filtered_state_dict_distributed(model, sam_checkpoint)
-    
-    # 清理sam_checkpoint
-    if local_rank == 0:
-        del sam_checkpoint
-    torch.cuda.empty_cache()
+
+    load_filtered_state_dict(model, sam_checkpoint)
     # model.load_state_dict(sam_checkpoint, strict=False)
     
     # ===== 分层MoE权重初始化逻辑 =====

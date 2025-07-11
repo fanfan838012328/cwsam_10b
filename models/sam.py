@@ -333,51 +333,6 @@ class PositionEmbeddingRandom(nn.Module):
 #         loss = loss * mask
 #         return loss.sum() / torch.ones_like(loss, device=loss.device).sum()
 
-#     def backward_G(self):
-#         """Calculate GAN and L1 loss for the generator"""
-#         # mask = self.create_ignore_mask(self.gt_mask, ignore_index=self.ignore_index)
-
-#         loss = self.criterionBCE(
-#             self.pred_mask, torch.argmax(self.gt_mask, dim=1, keepdim=True).squeeze(1)
-#         )  # (1,4,1024,1024)
-#         # print(
-#         #     f'未忽略类别loss:{self.criterionBCE(self.pred_mask, self.gt_mask).mean()}'
-#         # )
-#         # guanfang_crt = torch.nn.CrossEntropyLoss(ignore_index=0)
-#         # guanfang_loss = guanfang_crt(
-#         #     self.pred_mask, torch.argmax(self.gt_mask, dim=1, keepdim=True).squeeze(1)
-#         # )
-#         # print(f'guanfang忽略类别loss:{guanfang_loss}')
-#         # loss = self.get_ignore_mask_loss(loss, ignore_index=self.ignore_index)
-#         # print(f'忽略类别loss:{loss}')
-
-#         # loss = loss * mask  # 应用掩码
-#         # loss = loss.sum() / mask.sum()  # 仅计算非忽略像素的损失
-#         self.loss_G = loss
-#         # if self.loss_mode == 'iou':
-#         # self.loss_G += _iou_loss(self.pred_mask, self.gt_mask)
-
-#         self.loss_G.backward()
-
-#     def optimize_parameters(self):
-#         self.forward()
-#         self.optimizer.zero_grad()  # set G's gradients to zero
-#         self.backward_G()  # calculate graidents for G
-#         self.optimizer.step()  # udpate G's weights
-
-#     def set_requires_grad(self, nets, requires_grad=False):
-#         """Set requies_grad=Fasle for all the networks to avoid unnecessary computations
-#         Parameters:
-#             nets (network list)   -- a list of networks
-#             requires_grad (bool)  -- whether the networks require gradients or not
-#         """
-#         if not isinstance(nets, list):
-#             nets = [nets]
-#         for net in nets:
-#             if net is not None:
-#                 for param in net.parameters():
-#                     param.requires_grad = requires_grad
-
 @register('sam_hierarchical_moe_10b')
 class SAM_HIERARCHICAL_MOE_10B(nn.Module):
     def __init__(
@@ -606,7 +561,7 @@ class SAM_HIERARCHICAL_MOE_10B(nn.Module):
         loss = loss * mask
         return loss.sum() / torch.ones_like(loss, device=loss.device).sum()
 
-    def backward_G(self):
+    def backward_G(self, do_backward=True):
         """Calculate GAN and L1 loss for the generator"""
         # 确保数据类型一致，避免fp16/fp32混合导致的错误
         pred_mask = self.pred_mask
@@ -629,35 +584,29 @@ class SAM_HIERARCHICAL_MOE_10B(nn.Module):
             loss = self.criterionBCE(pred_mask, gt_target)
             self.loss_G = loss
         
-        # 使用scaler进行backward，支持混合精度训练
-        if hasattr(self, 'scaler') and self.scaler is not None:
-            self.scaler.scale(self.loss_G).backward()
-        else:
-            self.loss_G.backward()
-
-    def optimize_parameters(self):
-        # 进行前向传播，在外部调用
-        # self.forward() 已在train函数中分别调用
-        
-        # 梯度更新逻辑移到train函数中处理梯度累积
-        # 这里保持向后兼容
-        if not hasattr(self, '_gradient_accumulation_handled'):
-            self.forward()
-            self.optimizer.zero_grad()
-            self.backward_G()
+        if do_backward:
+            # 使用scaler进行backward，支持混合精度训练
             if hasattr(self, 'scaler') and self.scaler is not None:
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                self.scaler.scale(self.loss_G).backward()
             else:
-                self.optimizer.step()
+                self.loss_G.backward()
+
+    def optimize_parameters(self, accumulate_steps=1):
+        # 兼容梯度累积的优化流程
+        # 1. 前向传播
+        self.forward()
         
-        # 定期清理中间激活值和梯度
-        if hasattr(self, '_step_count'):
-            self._step_count += 1
-            if self._step_count % 10 == 0:
-                torch.cuda.empty_cache()
+        # 2. 计算损失 (不立即反向传播)
+        self.backward_G(do_backward=False)
+        
+        # 3. 缩放损失
+        scaled_loss = self.loss_G / accumulate_steps
+
+        # 4. 反向传播
+        if hasattr(self, 'scaler') and self.scaler is not None:
+            self.scaler.scale(scaled_loss).backward()
         else:
-            self._step_count = 1
+            scaled_loss.backward()
 
     def set_requires_grad(self, nets, requires_grad=False):
         """Set requies_grad=Fasle for all the networks to avoid unnecessary computations
