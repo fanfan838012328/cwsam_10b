@@ -13,7 +13,6 @@ from torch.cuda.amp.autocast_mode import autocast
 
 # from transformers import ViTModel
 from .mmseg.models.sam import (
-    MaskDecoder,
     MaskDecoder_moe,
     TwoWayTransformer_moe,
 
@@ -637,15 +636,28 @@ class SAM_HIERARCHICAL_MOE_10B(nn.Module):
             self.loss_G.backward()
 
     def optimize_parameters(self):
-        self.forward()
-        self.optimizer.zero_grad()
-        self.backward_G()
-        # 使用scaler更新参数，支持混合精度训练
-        if hasattr(self, 'scaler') and self.scaler is not None:
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+        # 进行前向传播，在外部调用
+        # self.forward() 已在train函数中分别调用
+        
+        # 梯度更新逻辑移到train函数中处理梯度累积
+        # 这里保持向后兼容
+        if not hasattr(self, '_gradient_accumulation_handled'):
+            self.forward()
+            self.optimizer.zero_grad()
+            self.backward_G()
+            if hasattr(self, 'scaler') and self.scaler is not None:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+        
+        # 定期清理中间激活值和梯度
+        if hasattr(self, '_step_count'):
+            self._step_count += 1
+            if self._step_count % 10 == 0:
+                torch.cuda.empty_cache()
         else:
-            self.optimizer.step()
+            self._step_count = 1
 
     def set_requires_grad(self, nets, requires_grad=False):
         """Set requies_grad=Fasle for all the networks to avoid unnecessary computations
