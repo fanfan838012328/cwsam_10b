@@ -97,7 +97,7 @@ def make_data_loader(spec, tag=''):
 
             log('  {}: shape={}'.format(k, tuple(v.shape)))
 
-    sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+    sampler = torch.utils.data.DistributedSampler(dataset)
     loader = DataLoader(
         dataset,
         batch_size=spec['batch_size'],
@@ -183,12 +183,18 @@ def eval_psnr(loader, model, config):
 
     # 聚合 Averager 的数据
     # 假设 Averager 有 .sum 和 .count 属性
-    metrics_data = torch.tensor([
-        val_metric1.sum, val_metric1.count,
-        val_metric2.sum, val_metric2.count,
-        val_metric3.sum, val_metric3.count,
-        val_metric4.sum, val_metric4.count,
-    ]).float().to(device)
+    metrics_data = torch.tensor(
+        [
+            val_metric1.v * val_metric1.n,
+            val_metric1.n,
+            val_metric2.v * val_metric2.n,
+            val_metric2.n,
+            val_metric3.v * val_metric3.n,
+            val_metric3.n,
+            val_metric4.v * val_metric4.n,
+            val_metric4.n,
+        ]
+    ).float().to(device)
     dist.all_reduce(metrics_data, op=dist.ReduceOp.SUM)
 
     # --- 在主进程计算并返回结果 ---

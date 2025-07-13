@@ -371,15 +371,16 @@ class SAM_HIERARCHICAL_MOE_10B(nn.Module):
             moe_k_groups=encoder_mode.get('moe_k_groups', 2),
             moe_k_experts=encoder_mode.get('moe_k_experts', 4),
             moe_noisy_gating=encoder_mode.get('moe_noisy_gating', True),
-            moe_start_layer_index=encoder_mode.get('moe_start_layer_index', 24)
+            moe_start_layer_index=encoder_mode.get('moe_start_layer_index', 24),
+            use_checkpoint=encoder_mode.get('use_checkpoint', False),
         )
         
         self.prompt_embed_dim = encoder_mode['prompt_embed_dim']
         
         # 定义解码器和Transformer的MoE参数
-        decoder_moe_num_experts = encoder_mode.get('decoder_moe_num_experts', 128)
+        decoder_moe_num_experts = encoder_mode.get('decoder_moe_num_experts', 126)
         decoder_moe_k = encoder_mode.get('decoder_moe_k', 2)
-        transformer_moe_num_experts = encoder_mode.get('transformer_moe_num_experts', 128)
+        transformer_moe_num_experts = encoder_mode.get('transformer_moe_num_experts', 126)
         transformer_moe_k = encoder_mode.get('transformer_moe_k', 2)
 
         # 使用MoE的Mask Decoder

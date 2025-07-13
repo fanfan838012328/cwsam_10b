@@ -773,6 +773,7 @@ class ImageEncoderViT_hierarchical_moe(nn.Module):
         moe_k_experts: int = 4,            # 每组内选择的专家数量
         moe_noisy_gating: bool = True,
         moe_start_layer_index: int = 24,   # 从第24层开始应用分层MoE
+        use_checkpoint: bool = False,
     ) -> None:
         """
         Args:
@@ -803,6 +804,7 @@ class ImageEncoderViT_hierarchical_moe(nn.Module):
         self.embed_dim = embed_dim
         self.depth = depth
         self.moe_start_layer_index = moe_start_layer_index
+        self.use_checkpoint = use_checkpoint
 
         self.patch_embed = PatchEmbed(
             kernel_size=(patch_size, patch_size),
@@ -840,7 +842,8 @@ class ImageEncoderViT_hierarchical_moe(nn.Module):
                 k_groups=moe_k_groups,
                 k_experts=moe_k_experts,
                 noisy_gating=moe_noisy_gating,
-                use_hierarchical_moe=use_hierarchical_moe
+                use_hierarchical_moe=use_hierarchical_moe,
+                use_checkpoint=self.use_checkpoint,
             )
             self.blocks.append(block)
 
@@ -901,7 +904,7 @@ class ImageEncoderViT_hierarchical_moe(nn.Module):
             x = prompt[i].reshape(B, H, W, -1) + x
             
             # 使用梯度检查点节省显存（如果启用且在训练状态）
-            if hasattr(blk, 'use_checkpoint') and blk.use_checkpoint and self.training:
+            if self.use_checkpoint and self.training:
                 # 使用梯度检查点
                 from torch.utils.checkpoint import checkpoint
                 x = checkpoint(blk, x, use_reentrant=False)
@@ -937,6 +940,7 @@ class HierarchicalBlock(nn.Module):
         k_experts: int = 4,
         noisy_gating: bool = True,
         use_hierarchical_moe: bool = True,
+        use_checkpoint: bool = False,
     ) -> None:
         """
         Args:
@@ -976,6 +980,7 @@ class HierarchicalBlock(nn.Module):
 
         self.norm2 = norm_layer(dim)
         self.use_hierarchical_moe = use_hierarchical_moe
+        self.use_checkpoint = use_checkpoint
         
         if self.use_hierarchical_moe:
             # 使用分层MoE

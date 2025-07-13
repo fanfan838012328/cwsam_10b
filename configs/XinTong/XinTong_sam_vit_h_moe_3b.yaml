@@ -15,9 +15,9 @@ train_dataset:
           [0, 0, 0], [1, 1, 1], [2, 2, 2], [3, 3, 3], [4, 4, 4], [5, 5, 5], [6, 6, 6], [7, 7, 7],[8, 8, 8], [9, 9, 9], [10, 10, 10], [11, 11, 11], [12, 12, 12], [13, 13, 13], [14, 14, 14], [15, 15, 15], [16, 16, 16], [17, 17, 17], [18, 18, 18], [19, 19, 19],
                       [20, 20, 20], [21, 21, 21], [22, 22, 22], [23, 23, 23], [24, 24, 24], [25, 25, 25], [26, 26, 26], [27, 27, 27], [28, 28, 28], [29, 29, 29], [30, 30, 30], [31, 31, 31], [32, 32, 32]
         ]
-      root_path_1: /mnt/fanfq/project/dataset/xingtong512_test/train/images
+      root_path_1: /mnt/fanfq/data/fan/data/dataset/XinTong512_new/train/images
       # root_path_1: /public/home/daiwenxuan/project/fan/data/dataset/beijing_ai_data_1027/train/images
-      root_path_2: /mnt/fanfq/project/dataset/xingtong512_test/train/labels
+      root_path_2: /mnt/fanfq/data/fan/data/dataset/XinTong512_new/train/labels
       # root_path_2: /public/home/daiwenxuan/project/fan/data/dataset/beijing_ai_data_1027/train/labels
       cache: none
       split_key: train
@@ -26,7 +26,7 @@ train_dataset:
     args:
       inp_size: 512
       augment: false
-  batch_size: 1
+  batch_size: 4
 
 val_dataset:
   dataset:
@@ -45,9 +45,9 @@ val_dataset:
           [0, 0, 0], [1, 1, 1], [2, 2, 2], [3, 3, 3], [4, 4, 4], [5, 5, 5], [6, 6, 6], [7, 7, 7],[8, 8, 8], [9, 9, 9], [10, 10, 10], [11, 11, 11], [12, 12, 12], [13, 13, 13], [14, 14, 14], [15, 15, 15], [16, 16, 16], [17, 17, 17], [18, 18, 18], [19, 19, 19],
                       [20, 20, 20], [21, 21, 21], [22, 22, 22], [23, 23, 23], [24, 24, 24], [25, 25, 25], [26, 26, 26], [27, 27, 27], [28, 28, 28], [29, 29, 29], [30, 30, 30], [31, 31, 31], [32, 32, 32]
         ]
-      root_path_1: /mnt/fanfq/project/dataset/xingtong512_test/val/images
+      root_path_1: /mnt/fanfq/data/fan/data/dataset/XinTong512_new/val/images
       # root_path_1: /public/home/daiwenxuan/project/fan/data/dataset/beijing_ai_data_1027/val/images
-      root_path_2: /mnt/fanfq/project/dataset/xingtong512_test/val/labels
+      root_path_2: /mnt/fanfq/data/fan/data/dataset/XinTong512_new/val/labels
       # root_path_2: /public/home/daiwenxuan/project/fan/data/dataset/beijing_ai_data_1027/val/labels
       cache: none
       split_key: test
@@ -75,8 +75,8 @@ test_dataset:
                       [20, 20, 20], [21, 21, 21], [22, 22, 22], [23, 23, 23], [24, 24, 24], [25, 25, 25], [26, 26, 26], [27, 27, 27], [28, 28, 28], [29, 29, 29], [30, 30, 30], [31, 31, 31], [32, 32, 32]
         ]
 
-      root_path_1: /mnt/fanfq/project/dataset/xingtong512_test/val_test/images
-      root_path_2: /mnt/fanfq/project/dataset/xingtong512_test/val_test/images
+      root_path_1: /mnt/fanfq/data/fan/data/dataset/XinTong512_new/val_test/images
+      root_path_2: /mnt/fanfq/data/fan/data/dataset/XinTong512_new/val_test/images
       cache: none
       split_key: test
   wrapper:
@@ -129,7 +129,7 @@ model:
       embedding_tune: true
       adaptor: adaptor
       embed_dim: 1280
-      depth: 32
+      depth: 38
       num_heads: 16
       global_attn_indexes:
       - 7
@@ -137,12 +137,13 @@ model:
       - 23
       - 31
       - 39
-      moe_num_expert_groups: 5
+      moe_num_expert_groups: 3
       moe_experts_per_group: 16
       moe_k_groups: 2
       moe_k_experts: 4
       moe_noisy_gating: true
       moe_start_layer_index: 24
+      use_checkpoint: true
 optimizer:
   name: adamw 
   args:

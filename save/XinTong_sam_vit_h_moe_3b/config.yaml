@@ -137,8 +137,8 @@ train_dataset:
       - - 32
         - 32
         - 32
-      root_path_1: /mnt/fanfq/project/dataset/xingtong512_test/train/images
-      root_path_2: /mnt/fanfq/project/dataset/xingtong512_test/train/labels
+      root_path_1: /mnt/fanfq/data/fan/data/dataset/XinTong512_new/train/images
+      root_path_2: /mnt/fanfq/data/fan/data/dataset/XinTong512_new/train/labels
       cache: none
       split_key: train
   wrapper:
@@ -146,7 +146,7 @@ train_dataset:
     args:
       inp_size: 512
       augment: false
-  batch_size: 1
+  batch_size: 4
 val_dataset:
   dataset:
     name: paired-image-folders
@@ -286,8 +286,8 @@ val_dataset:
       - - 32
         - 32
         - 32
-      root_path_1: /mnt/fanfq/project/dataset/xingtong512_test/val/images
-      root_path_2: /mnt/fanfq/project/dataset/xingtong512_test/val/labels
+      root_path_1: /mnt/fanfq/data/fan/data/dataset/XinTong512_new/val/images
+      root_path_2: /mnt/fanfq/data/fan/data/dataset/XinTong512_new/val/labels
       cache: none
       split_key: test
   wrapper:
@@ -434,8 +434,8 @@ test_dataset:
       - - 32
         - 32
         - 32
-      root_path_1: /mnt/fanfq/project/dataset/xingtong512_test/val_test/images
-      root_path_2: /mnt/fanfq/project/dataset/xingtong512_test/val_test/images
+      root_path_1: /mnt/fanfq/data/fan/data/dataset/XinTong512_new/val_test/images
+      root_path_2: /mnt/fanfq/data/fan/data/dataset/XinTong512_new/val_test/images
       cache: none
       split_key: test
   wrapper:
@@ -520,7 +520,7 @@ model:
       embedding_tune: true
       adaptor: adaptor
       embed_dim: 1280
-      depth: 32
+      depth: 38
       num_heads: 16
       global_attn_indexes:
       - 7
@@ -528,12 +528,13 @@ model:
       - 23
       - 31
       - 39
-      moe_num_expert_groups: 5
+      moe_num_expert_groups: 3
       moe_experts_per_group: 16
       moe_k_groups: 2
       moe_k_experts: 4
       moe_noisy_gating: true
       moe_start_layer_index: 24
+      use_checkpoint: true
 optimizer:
   name: adamw
   args:
