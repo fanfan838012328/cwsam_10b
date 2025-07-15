@@ -8,34 +8,25 @@ import torch.nn.functional as F
 import timm
 import math
 from models import register
-from torchvision.models import vit_b_16, vit_l_16
-from .vit_modified import vit_h_14
 
 # from transformers import ViTModel
 from .mmseg.models.sam import (
     ImageEncoderViT,
     MaskDecoder,
-    MaskDecoderOnlyCls,
+
     TwoWayTransformer,
-    ImageEncoderViT_vitadp,
-    ImageEncoderViT_tinyadp,
-    ImageEncoderViT_vitadp_b2b,
-    ImageEncoderViT_vitlora,
-    ImageEncoderViT_vitlora_mix_adapter,
-    ImageEncoderViT_tiny_lora_mix_adapter,
-    ImageEncoderViT_vit_GAM,
+
     MaskDecoder_moe,
     TwoWayTransformer_moe,
-    ImageEncoderViT_moe,
+
     ImageEncoderViT_moe_layer,
-    ImageEncoderViT_soft_moe
+
 )
 
 logger = logging.getLogger(__name__)
 from .iou_loss import IOU
 from typing import Any, Optional, Tuple
-from .deeplabv3plus import DeepLab
-from .swin_transformerv2 import SwinTransformerV2
+
 
 
 def onehot_to_mask(mask, palette):
