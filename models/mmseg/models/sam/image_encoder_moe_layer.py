@@ -983,18 +983,33 @@ class HierarchicalBlock(nn.Module):
         self.use_checkpoint = use_checkpoint
         
         if self.use_hierarchical_moe:
-            # 使用分层MoE
-            from .common import HierarchicalMoEMLPBlock
-            self.mlp = HierarchicalMoEMLPBlock(
-                embedding_dim=dim,
-                mlp_dim=int(dim * mlp_ratio),
-                act=act_layer,
-                num_expert_groups=num_expert_groups,
-                experts_per_group=experts_per_group,
-                k_groups=k_groups,
-                k_experts=k_experts,
-                noisy_gating=noisy_gating
-            )
+            # 使用优化的分层MoE
+            try:
+                from .efficient_moe import OptimizedHierarchicalMoEMLPBlock
+                self.mlp = OptimizedHierarchicalMoEMLPBlock(
+                    embedding_dim=dim,
+                    mlp_dim=int(dim * mlp_ratio),
+                    act=act_layer,
+                    num_expert_groups=num_expert_groups,
+                    experts_per_group=experts_per_group,
+                    k_groups=k_groups,
+                    k_experts=k_experts,
+                    expert_capacity_factor=1.5,
+                    use_checkpoint=self.use_checkpoint,
+                )
+            except ImportError:
+                # 回退到原始实现
+                from .common import HierarchicalMoEMLPBlock
+                self.mlp = HierarchicalMoEMLPBlock(
+                    embedding_dim=dim,
+                    mlp_dim=int(dim * mlp_ratio),
+                    act=act_layer,
+                    num_expert_groups=num_expert_groups,
+                    experts_per_group=experts_per_group,
+                    k_groups=k_groups,
+                    k_experts=k_experts,
+                    noisy_gating=noisy_gating
+                )
         else:
             # 使用标准MLP
             self.mlp = MLPBlock(

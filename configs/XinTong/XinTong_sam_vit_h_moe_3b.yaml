@@ -26,7 +26,7 @@ train_dataset:
     args:
       inp_size: 512
       augment: false
-  batch_size: 4
+  batch_size: 6
 
 val_dataset:
   dataset:
@@ -139,7 +139,7 @@ model:
       - 39
       moe_num_expert_groups: 3
       moe_experts_per_group: 16
-      moe_k_groups: 2
+      moe_k_groups: 1
       moe_k_experts: 4
       moe_noisy_gating: true
       moe_start_layer_index: 24

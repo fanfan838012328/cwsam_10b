@@ -583,7 +583,14 @@ class SAM_HIERARCHICAL_MOE_10B(nn.Module):
                     self.criterionBCE.weight.data = self.criterionBCE.weight.data.float()
             
             loss = self.criterionBCE(pred_mask, gt_target)
-            self.loss_G = loss
+            
+            # 添加MoE负载均衡损失
+            load_balance_loss = 0.0
+            for name, module in self.named_modules():
+                if hasattr(module, 'load_balance_loss'):
+                    load_balance_loss += module.load_balance_loss
+            
+            self.loss_G = loss + load_balance_loss
         
         if do_backward:
             # 使用scaler进行backward，支持混合精度训练

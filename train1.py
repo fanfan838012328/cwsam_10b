@@ -446,214 +446,57 @@ def main(config_, save_path, args):
     load_filtered_state_dict(model, sam_checkpoint)
     # model.load_state_dict(sam_checkpoint, strict=False)
     
-    # ===== 分层MoE权重初始化逻辑 =====
-    def initialize_hierarchical_moe_from_1_5b(model, sam_checkpoint):
+    # ===== 高效MoE权重初始化逻辑 =====
+    def initialize_efficient_moe_from_1_5b(model, sam_checkpoint):
         """
-        从1.5B模型的16个专家初始化分层MoE的6组×16个专家
-        策略1：第一个专家组放置原始16个专家并冻结，其他组使用复制+噪声和专家融合
+        使用新的高效MoE架构初始化权重
+        兼容原始1.5B专家权重
         """
         if local_rank == 0:
-            log("开始初始化分层MoE权重...")
+            log("开始使用高效MoE架构初始化权重...")
         
-        # 首先检查模型是否使用分层MoE
-        hierarchical_moe_layers = []
+        # 首先检查模型是否使用高效MoE
+        efficient_moe_layers = []
         for name, module in model.named_modules():
-            if hasattr(module, 'use_hierarchical_moe') and module.use_hierarchical_moe:
-                hierarchical_moe_layers.append(name)
+            if hasattr(module, 'load_1_5b_expert_weights'):
+                efficient_moe_layers.append((name, module))
         
-        if len(hierarchical_moe_layers) == 0:
+        if len(efficient_moe_layers) == 0:
             if local_rank == 0:
-                log("未找到分层MoE层，跳过初始化")
+                log("未找到高效MoE层，使用传统初始化方法")
+            # 回退到原始初始化方法
+            initialize_hierarchical_moe_from_1_5b(model, sam_checkpoint)
             return
         
-        # 查找原始16个专家的权重
-        original_experts = {}
-        for key, value in sam_checkpoint.items():
-            if 'experts.' in key and 'image_encoder' in key:
-                # 解析专家索引，例如 'image_encoder.blocks.28.mlp.experts.0.0.weight'
-                parts = key.split('.')
-                expert_idx = None
-                for i, part in enumerate(parts):
-                    if part == 'experts' and i + 1 < len(parts):
-                        try:
-                            expert_idx = int(parts[i + 1])
-                            break
-                        except ValueError:
-                            continue
-                
-                if expert_idx is not None and 0 <= expert_idx < 16:
-                    # 重构key，移除layer信息，只保留专家相对路径
-                    expert_key = '.'.join(parts[parts.index('experts'):])
-                    original_experts[expert_key] = value
-        
         if local_rank == 0:
-            log(f"找到 {len(original_experts)} 个原始专家权重")
+            log(f"找到 {len(efficient_moe_layers)} 个高效MoE层")
         
-        if local_rank == 0:
-            log(f"找到 {len(hierarchical_moe_layers)} 个分层MoE层")
-        
-        # 为每个分层MoE层初始化专家权重
+        # 使用新的权重加载方法
         with torch.no_grad():
-            for layer_name in hierarchical_moe_layers:
-                layer_module = dict(model.named_modules())[layer_name]
-                if hasattr(layer_module, 'mlp') and hasattr(layer_module.mlp, 'expert_groups'):
-                    mlp_module = layer_module.mlp
-                    
-                    # 动态获取实际的专家组数量
-                    actual_num_groups = len(mlp_module.expert_groups)
-                    actual_experts_per_group = len(mlp_module.expert_groups[0]) if actual_num_groups > 0 else 0
-                    
-                    if local_rank == 0:
-                        log(f"层 {layer_name}: 发现 {actual_num_groups} 个专家组，每组 {actual_experts_per_group} 个专家")
-                    
-                    # 对实际的专家组进行初始化
-                    for group_idx in range(actual_num_groups):
-                        expert_group = mlp_module.expert_groups[group_idx]
-                        
-                        if group_idx == 0:
-                            # 第一个专家组：放置原始16个专家，精确复制权重（不添加噪声）
-                            if local_rank == 0:
-                                log(f"  初始化第一个专家组（原始专家，将被冻结）...")
-                            
-                            for expert_idx in range(min(actual_experts_per_group, 16)):
-                                expert = expert_group[expert_idx]
-                                source_expert_idx = expert_idx
-                                
-                                # 精确复制原始专家权重，不添加噪声
-                                for orig_key, orig_weight in original_experts.items():
-                                    if f'experts.{source_expert_idx}.' in orig_key:
-                                        # 构建目标权重的路径
-                                        target_key = orig_key.replace(f'experts.{source_expert_idx}.', '')
-                                        
-                                        # 获取目标模块
-                                        target_parts = target_key.split('.')
-                                        target_module = expert
-                                        for part in target_parts[:-1]:
-                                            target_module = getattr(target_module, part)
-                                        
-                                        param_name = target_parts[-1]
-                                        if hasattr(target_module, param_name):
-                                            target_param = getattr(target_module, param_name)
-                                            # 精确复制，保持原始预训练权重
-                                            target_param.data.copy_(orig_weight.clone())
-                            
-                            # 如果专家组有超过16个专家，其余的用随机初始化
-                            if actual_experts_per_group > 16:
-                                for expert_idx in range(16, actual_experts_per_group):
-                                    expert = expert_group[expert_idx]
-                                    # 使用随机初始化（小权重）
-                                    for module in expert.modules():
-                                        if isinstance(module, torch.nn.Linear):
-                                            torch.nn.init.normal_(module.weight, mean=0.0, std=0.01)
-                                            if module.bias is not None:
-                                                torch.nn.init.constant_(module.bias, 0.0)
-                        
-                        else:
-                            # 其他专家组：使用复制+噪声和专家融合策略
-                            if local_rank == 0:
-                                log(f"  初始化第{group_idx+1}个专家组（新专家，可训练）...")
-                            
-                            for expert_idx in range(actual_experts_per_group):
-                                expert = expert_group[expert_idx]
-                                
-                                if expert_idx < 16:
-                                    # 复制原始专家并添加噪声
-                                    source_expert_idx = expert_idx
-                                    noise_std = 0.02 * group_idx  # 不同组使用不同噪声强度
-                                    
-                                    for orig_key, orig_weight in original_experts.items():
-                                        if f'experts.{source_expert_idx}.' in orig_key:
-                                            # 构建目标权重的路径
-                                            target_key = orig_key.replace(f'experts.{source_expert_idx}.', '')
-                                            
-                                            # 获取目标模块
-                                            target_parts = target_key.split('.')
-                                            target_module = expert
-                                            for part in target_parts[:-1]:
-                                                target_module = getattr(target_module, part)
-                                            
-                                            param_name = target_parts[-1]
-                                            if hasattr(target_module, param_name):
-                                                target_param = getattr(target_module, param_name)
-                                                
-                                                # 复制并添加噪声
-                                                copied_weight = orig_weight.clone()
-                                                noise = torch.randn_like(copied_weight) * noise_std
-                                                target_param.data.copy_(copied_weight + noise)
-                                
-                                else:
-                                    # 超出原专家数量，使用专家融合
-                                    expert1_idx = torch.randint(0, 16, (1,)).item()
-                                    expert2_idx = torch.randint(0, 16, (1,)).item()
-                                    
-                                    # 随机插值权重
-                                    alpha = torch.rand(1).item() * 0.6 + 0.2  # 0.2-0.8之间
-                                    beta = 1.0 - alpha
-                                    
-                                    # 融合两个专家的权重
-                                    for orig_key, orig_weight in original_experts.items():
-                                        if f'experts.{expert1_idx}.' in orig_key:
-                                            # 找到对应的第二个专家权重
-                                            expert2_key = orig_key.replace(f'experts.{expert1_idx}.', f'experts.{expert2_idx}.')
-                                            if expert2_key in original_experts:
-                                                expert2_weight = original_experts[expert2_key]
-                                                
-                                                # 线性插值
-                                                fused_weight = alpha * orig_weight + beta * expert2_weight
-                                                
-                                                # 设置到目标专家
-                                                target_key = orig_key.replace(f'experts.{expert1_idx}.', '')
-                                                target_parts = target_key.split('.')
-                                                target_module = expert
-                                                for part in target_parts[:-1]:
-                                                    target_module = getattr(target_module, part)
-                                                
-                                                param_name = target_parts[-1]
-                                                if hasattr(target_module, param_name):
-                                                    target_param = getattr(target_module, param_name)
-                                                    target_param.data.copy_(fused_weight)
-                        
-                        # 初始化组内门控网络
-                        if group_idx < len(mlp_module.expert_gates):
-                            group_gate = mlp_module.expert_gates[group_idx]
-                            
-                            # 使用小的随机权重初始化门控网络
-                            if hasattr(group_gate, 'weight'):
-                                torch.nn.init.normal_(group_gate.weight, mean=0.0, std=0.01)
-                            if hasattr(group_gate, 'bias') and group_gate.bias is not None:
-                                torch.nn.init.constant_(group_gate.bias, 0.0)
-                    
-                    # 初始化第一级门控网络（专家组选择）
-                    if hasattr(mlp_module, 'group_gate'):
-                        torch.nn.init.normal_(mlp_module.group_gate.weight, mean=0.0, std=0.01)
-                        if mlp_module.group_gate.bias is not None:
-                            torch.nn.init.constant_(mlp_module.group_gate.bias, 0.0)
+            if local_rank == 0:
+                log(f"开始加载 {len(efficient_moe_layers)} 个MoE层的权重...")
+            
+            for layer_name, moe_module in efficient_moe_layers:
+                # 使用新的权重加载方法
+                moe_module.load_1_5b_expert_weights(sam_checkpoint)
         
-        # 冻结第一个专家组的权重（原始专家）
-        if local_rank == 0:
-            log("冻结第一个专家组的权重（原始1.5B专家）...")
-        
+        # 统计冻结参数（如果有的话）
         frozen_params = 0
-        for layer_name in hierarchical_moe_layers:
-            layer_module = dict(model.named_modules())[layer_name]
-            if hasattr(layer_module, 'mlp') and hasattr(layer_module.mlp, 'expert_groups'):
-                mlp_module = layer_module.mlp
-                
-                # 冻结第一个专家组的所有参数
-                if len(mlp_module.expert_groups) > 0:
-                    first_expert_group = mlp_module.expert_groups[0]
-                    for expert in first_expert_group:
-                        for param in expert.parameters():
-                            param.requires_grad = False
-                            frozen_params += param.numel()
+        trainable_params = 0
+        for param in model.parameters():
+            if param.requires_grad:
+                trainable_params += param.numel()
+            else:
+                frozen_params += param.numel()
         
         if local_rank == 0:
-            log(f"已冻结 {frozen_params:,} 个原始专家参数")
-            log("分层MoE权重初始化完成")
+            log(f"高效MoE权重初始化完成")
+            log(f"冻结参数: {frozen_params:,}")
+            log(f"可训练参数: {trainable_params:,}")
     
     # 调用权重初始化函数
     if config['model']['name'] == 'sam_hierarchical_moe_10b' or 'hierarchical_moe' in config['model']['name']:
-        initialize_hierarchical_moe_from_1_5b(model, sam_checkpoint)
+        initialize_efficient_moe_from_1_5b(model, sam_checkpoint)
 
     print_model_parameters(model)
     if local_rank == 0:
