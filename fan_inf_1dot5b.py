@@ -34,7 +34,7 @@ def main():
                        default='/public/home/daiwenxuan/project/fan/cwsam/save/XinTong_sam_vit_h_moe_3b/model_epoch_121.pth',
                        help='模型权重路径')
     parser.add_argument('--input_dir', 
-                       default='/public/home/daiwenxuan/project/fan/data/dataset/XinTong/train_100',
+                       default='/mnt/fanfq/data/fan/data/dataset/XinTong512_new/train_100',
                        help='输入图像文件夹')
     parser.add_argument('--output_dir', 
                        default='/public/home/daiwenxuan/project/fan/cwsam/output/train_100img_121',

@@ -6,6 +6,7 @@
 # vit adaptor and lowpass fft
 from PIL import Image
 import numpy as np
+import math
 
 import torch
 import torch.nn as nn

@@ -9,6 +9,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from typing import Optional, Tuple, Type, List, Dict, Any
 from functools import partial
 
@@ -200,6 +201,7 @@ class ScalableImageEncoderViT(nn.Module):
         prompt_scale_factor: int = 32,
         prompt_type: str = 'highpass',
         freq_nums: float = 0.25,
+        use_gradient_checkpointing: bool = True,
     ) -> None:
         """
         初始化可扩展图像编码器
@@ -235,6 +237,7 @@ class ScalableImageEncoderViT(nn.Module):
         self.moe_start_layer = self.config.moe_start_layer
         self.moe_num_experts = self.config.moe_num_experts
         self.use_multi_scale = self.config.use_multi_scale
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         
         # 验证配置合理性
         self._validate_config()
@@ -267,7 +270,7 @@ class ScalableImageEncoderViT(nn.Module):
             self.multi_scale_pyramid = MultiScaleFeaturePyramid(
                 embed_dim=self.embed_dim,
                 scales=[1, 2, 4],
-                use_attention_fusion=True
+                fusion_method="attention"
             )
         
         # 输出颈部网络
@@ -451,8 +454,11 @@ class ScalableImageEncoderViT(nn.Module):
                 prompt = prompts[i].reshape(B, H, W, -1)
                 x = x + prompt
             
-            # 前向传播
-            x = block(x)
+            # 前向传播（使用梯度检查点节省内存）
+            if self.use_gradient_checkpointing and self.training:
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
             
             # 收集辅助损失
             aux_losses = block.get_aux_losses()
