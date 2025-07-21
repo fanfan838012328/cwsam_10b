@@ -6,6 +6,7 @@
 
 from .sam import Sam
 from .image_encoder import ImageEncoderViT
+from .image_encoder_moe_layer import ImageEncoderViT as ImageEncoderViT_moe_layer
 from .mask_decoder import MaskDecoder
 from .prompt_encoder import PromptEncoder
 from .transformer import TwoWayTransformer

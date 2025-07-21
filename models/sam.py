@@ -13,20 +13,20 @@ from models import register
 from .mmseg.models.sam import (
     ImageEncoderViT,
     MaskDecoder,
-
     TwoWayTransformer,
-
     MaskDecoder_moe,
     TwoWayTransformer_moe,
-
     ImageEncoderViT_moe_layer,
-
 )
 
 logger = logging.getLogger(__name__)
 from .iou_loss import IOU
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
+# 导入可扩展组件
+from .config import CWSAMScalingConfig, ModelScalingConfig
+from .scalable_image_encoder import ScalableImageEncoderViT
+from .scalable_mask_decoder import ScalableMaskDecoder
 
 
 def onehot_to_mask(mask, palette):
@@ -120,8 +120,13 @@ class PositionEmbeddingRandom(nn.Module):
         pe = self._pe_encoding(torch.stack([x_embed, y_embed], dim=-1))
         return pe.permute(2, 0, 1)  # C x H x W
 
-@register('sam_moe_3b')
-class SAM_MOE_3B(nn.Module):
+
+@register('scalable_sam')
+class ScalableSAM(nn.Module):
+    """
+    可扩展的SAM模型，支持不同参数规模
+    """
+    
     def __init__(
         self,
         inp_size=None,
@@ -130,18 +135,19 @@ class SAM_MOE_3B(nn.Module):
         num_classes=None,
         loss_weight=None,
         ignore_index=-100,
+        config=None
     ):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.embed_dim = encoder_mode['embed_dim']
-        self.image_encoder = ImageEncoderViT_moe_layer(
+        self.config = config
+        
+        # 使用可扩展图像编码器
+        self.image_encoder = ScalableImageEncoderViT(
+            config=CWSAMScalingConfig(config.model_size),
             img_size=inp_size,
             patch_size=encoder_mode['patch_size'],
             in_chans=3,
-            embed_dim=encoder_mode['embed_dim'],
-            depth=encoder_mode['depth'],
-            num_heads=encoder_mode['num_heads'],
-            mlp_ratio=encoder_mode['mlp_ratio'],
             out_chans=encoder_mode['out_chans'],
             qkv_bias=encoder_mode['qkv_bias'],
             norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
@@ -150,47 +156,37 @@ class SAM_MOE_3B(nn.Module):
             rel_pos_zero_init=True,
             window_size=encoder_mode['window_size'],
             global_attn_indexes=encoder_mode['global_attn_indexes'],
-            moe_num_experts=16,
-            moe_k=4,
-            moe_noisy_gating=True,
-            moe_start_layer_index=28
         )
+        
         self.prompt_embed_dim = encoder_mode['prompt_embed_dim']
-        self.mask_decoder = MaskDecoder(
-            num_multimask_outputs=3,
-            transformer=TwoWayTransformer_moe(
-                depth=2,
-                embedding_dim=self.prompt_embed_dim,
-                mlp_dim=2048,
-                num_heads=8,
-            ),
+        
+        # 使用可扩展掩码解码器
+        self.mask_decoder = ScalableMaskDecoder(
+            config=CWSAMScalingConfig(config.model_size),
             transformer_dim=self.prompt_embed_dim,
+            num_multimask_outputs=3,
+            activation=nn.GELU,
             iou_head_depth=3,
             iou_head_hidden_dim=256,
             num_classes=num_classes,
         )
 
-        if 'evp' in encoder_mode['name']:
-            for k, p in self.encoder.named_parameters():
-                if (
-                    "prompt" not in k
-                    and "mask_decoder" not in k
-                    and "prompt_encoder" not in k
-                ):
-                    p.requires_grad = False
-
+        # 初始化其他组件
+        self._init_components(loss, ignore_index, loss_weight)
+        
+        self.inp_size = inp_size
+        self.image_embedding_size = inp_size // encoder_mode['patch_size']
+    
+    def _init_components(self, loss, ignore_index, loss_weight):
+        """初始化损失函数和位置编码等组件"""
         self.loss_mode = loss
         self.ignore_index = ignore_index
 
         if self.loss_mode == 'bce':
             self.criterionBCE = torch.nn.BCEWithLogitsLoss(reduction='none')
-
         elif self.loss_mode == 'bbce':
             self.criterionBCE = BBCEWithLogitLoss(reduction='none')
-
         elif self.loss_mode == 'iou':
-            # self.criterionBCE = torch.nn.BCEWithLogitsLoss()
-            # pos_weight = torch.tensor([1.5, 1, 0.5, 1.9, 0.1], dtype=torch.float)
             if loss_weight is not None:
                 pos_weight = torch.tensor(loss_weight, dtype=torch.float)
                 self.criterionBCE = torch.nn.CrossEntropyLoss(
@@ -200,18 +196,11 @@ class SAM_MOE_3B(nn.Module):
                 self.criterionBCE = torch.nn.CrossEntropyLoss(
                     ignore_index=self.ignore_index
                 )
-
             self.criterionIOU = IOU()
 
-        # elif self.loss_mode == 'iou_ce':
-        #     self.criterionBCE =  torch.nn.CrossEntropyLoss()
-        #     self.criterionIOU = IOU()
-
-        self.pe_layer = PositionEmbeddingRandom(encoder_mode['prompt_embed_dim'] // 2)
-        self.inp_size = inp_size
-        self.image_embedding_size = inp_size // encoder_mode['patch_size']
-        self.no_mask_embed = nn.Embedding(1, encoder_mode['prompt_embed_dim'])
-
+        self.pe_layer = PositionEmbeddingRandom(self.prompt_embed_dim // 2)
+        self.no_mask_embed = nn.Embedding(1, self.prompt_embed_dim)
+    
     def set_input(self, input, gt_mask):
         self.input = input.to(self.device)
         self.gt_mask = gt_mask.to(self.device)
@@ -228,7 +217,6 @@ class SAM_MOE_3B(nn.Module):
         return self.pe_layer(self.image_embedding_size).unsqueeze(0)
 
     def forward(self):
-        # bs = 1
         bs = self.input.shape[0]
 
         # Embed prompts
@@ -253,9 +241,10 @@ class SAM_MOE_3B(nn.Module):
         # Upscale the masks to the original image resolution
         masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
         self.pred_mask = masks
+        return masks
 
     def infer(self, input):
-        bs = 1
+        bs = input.shape[0] if len(input.shape) > 3 else 1
 
         # Embed prompts
         sparse_embeddings = torch.empty(
@@ -265,7 +254,7 @@ class SAM_MOE_3B(nn.Module):
             bs, -1, self.image_embedding_size, self.image_embedding_size
         )
 
-        self.features = self.image_encoder(input)  # 第一个val 第二张图推理循环 显存+5G
+        self.features = self.image_encoder(input)
 
         # Predict masks
         low_res_masks, iou_predictions = self.mask_decoder(
@@ -278,14 +267,13 @@ class SAM_MOE_3B(nn.Module):
 
         # Upscale the masks to the original image resolution
         masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
-        # masks_rgb= onehot_to_mask(masks)
         return masks
 
     def postprocess_masks(
         self,
         masks: torch.Tensor,
-        input_size: Tuple[int, ...],
-        original_size: Tuple[int, ...],
+        input_size: int,
+        original_size: int,
     ) -> torch.Tensor:
         """
         Remove padding and upscale masks to the original image size.
@@ -293,66 +281,34 @@ class SAM_MOE_3B(nn.Module):
         Arguments:
           masks (torch.Tensor): Batched masks from the mask_decoder,
             in BxCxHxW format.
-          input_size (tuple(int, int)): The size of the image input to the
-            model, in (H, W) format. Used to remove padding.
-          original_size (tuple(int, int)): The original size of the image
-            before resizing for input to the model, in (H, W) format.
+          input_size (int): The size of the image input to the
+            model. Used to remove padding.
+          original_size (int): The original size of the image
+            before resizing for input to the model.
 
         Returns:
           (torch.Tensor): Batched masks in BxCxHxW format, where (H, W)
             is given by original_size.
         """
-        # masks = masks[0]
         masks = masks.squeeze(dim=1)
-        masks = F.interpolate(
+        masks = torch.nn.functional.interpolate(
             masks,
             (self.image_encoder.img_size, self.image_encoder.img_size),
             mode="bilinear",
             align_corners=False,
         )
         masks = masks[..., :input_size, :input_size]
-        masks = F.interpolate(
-            masks, original_size, mode="bilinear", align_corners=False
+        masks = torch.nn.functional.interpolate(
+            masks, (original_size, original_size), mode="bilinear", align_corners=False
         )
         return masks
 
-    def get_ignore_mask_loss(self, loss, ignore_index: list = None):
-        """Create a mask to ignore certain pixels in the ground truth."""
-        # 创建一个掩码
-        mask = torch.ones_like(loss, device=loss.device)
-
-        # 对于每个要屏蔽的类别，将掩码设置为0
-        for index in ignore_index:
-            mask[torch.argmax(self.gt_mask, dim=1) == index] = 0
-
-        # 应用掩码到损失上
-        loss = loss * mask
-        return loss.sum() / torch.ones_like(loss, device=loss.device).sum()
-
     def backward_G(self):
-        """Calculate GAN and L1 loss for the generator"""
-        # mask = self.create_ignore_mask(self.gt_mask, ignore_index=self.ignore_index)
-
+        """Calculate loss for the generator"""
         loss = self.criterionBCE(
             self.pred_mask, torch.argmax(self.gt_mask, dim=1, keepdim=True).squeeze(1)
-        )  # (1,4,1024,1024)
-        # print(
-        #     f'未忽略类别loss:{self.criterionBCE(self.pred_mask, self.gt_mask).mean()}'
-        # )
-        # guanfang_crt = torch.nn.CrossEntropyLoss(ignore_index=0)
-        # guanfang_loss = guanfang_crt(
-        #     self.pred_mask, torch.argmax(self.gt_mask, dim=1, keepdim=True).squeeze(1)
-        # )
-        # print(f'guanfang忽略类别loss:{guanfang_loss}')
-        # loss = self.get_ignore_mask_loss(loss, ignore_index=self.ignore_index)
-        # print(f'忽略类别loss:{loss}')
-
-        # loss = loss * mask  # 应用掩码
-        # loss = loss.sum() / mask.sum()  # 仅计算非忽略像素的损失
+        )
         self.loss_G = loss
-        # if self.loss_mode == 'iou':
-        # self.loss_G += _iou_loss(self.pred_mask, self.gt_mask)
-
         self.loss_G.backward()
 
     def optimize_parameters(self):
@@ -373,3 +329,129 @@ class SAM_MOE_3B(nn.Module):
             if net is not None:
                 for param in net.parameters():
                     param.requires_grad = requires_grad
+    
+    def get_model_info(self) -> Dict[str, Any]:
+        """获取模型信息"""
+        # 获取图像编码器信息
+        encoder_info = self.image_encoder.get_model_info()
+        
+        # 计算总参数量
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        
+        return {
+            "model_size": self.config.model_size,
+            "total_params": total_params,
+            "trainable_params": trainable_params,
+            "encoder_info": encoder_info,
+            "decoder_depth": self.config.decoder_depth,
+            "moe_num_experts": self.config.moe_num_experts,
+            "embed_dim": self.config.embed_dim,
+            "use_multi_scale": self.config.use_multi_scale,
+        }
+    
+    def print_model_info(self):
+        """打印模型信息"""
+        info = self.get_model_info()
+        print(f"\n=== ScalableSAM {info['model_size']} 模型信息 ===")
+        print(f"总参数量: {info['total_params']:,} ({info['total_params']/1e9:.2f}B)")
+        print(f"可训练参数: {info['trainable_params']:,}")
+        print(f"嵌入维度: {info['embed_dim']}")
+        print(f"MoE专家数: {info['moe_num_experts']}")
+        print(f"解码器深度: {info['decoder_depth']}")
+        print(f"多尺度特征: {'启用' if info['use_multi_scale'] else '禁用'}")
+        print("=" * 45)
+
+
+@register('sam_moe_3b')
+class SAM_MOE_3B(nn.Module):
+    """
+    SAM_MOE_3B类 - 为了向后兼容而保留
+    现在是ScalableSAM的包装器，使用3B配置
+    """
+    def __init__(
+        self,
+        inp_size=None,
+        encoder_mode=None,
+        loss=None,
+        num_classes=None,
+        loss_weight=None,
+        ignore_index=-100,
+    ):
+        super().__init__()
+        
+        # 创建3B配置
+        config = ModelScalingConfig(
+            model_size="3B",
+            moe_num_experts=64,
+            depth=40,
+            embed_dim=1536,
+            num_heads=24,
+            moe_start_layer=20,
+            use_multi_scale=True,
+            decoder_depth=4
+        )
+        
+        # 创建ScalableSAM实例
+        self.model = ScalableSAM(
+            inp_size=inp_size,
+            encoder_mode=encoder_mode,
+            loss=loss,
+            num_classes=num_classes,
+            loss_weight=loss_weight,
+            ignore_index=ignore_index,
+            config=config
+        )
+        
+        # 设置设备
+        self.device = self.model.device
+        
+        # 复制关键属性以保持兼容性
+        self.image_encoder = self.model.image_encoder
+        self.mask_decoder = self.model.mask_decoder
+        self.prompt_embed_dim = self.model.prompt_embed_dim
+        self.pe_layer = self.model.pe_layer
+        self.no_mask_embed = self.model.no_mask_embed
+        self.loss_mode = self.model.loss_mode
+        self.ignore_index = self.model.ignore_index
+        self.criterionBCE = self.model.criterionBCE
+        if hasattr(self.model, 'criterionIOU'):
+            self.criterionIOU = self.model.criterionIOU
+        self.inp_size = self.model.inp_size
+        self.image_embedding_size = self.model.image_embedding_size
+    
+    def set_input(self, input, gt_mask):
+        self.model.set_input(input, gt_mask)
+        self.input = self.model.input
+        self.gt_mask = self.model.gt_mask
+    
+    def get_dense_pe(self):
+        return self.model.get_dense_pe()
+    
+    def forward(self):
+        masks = self.model.forward()
+        self.features = self.model.features
+        self.pred_mask = self.model.pred_mask
+        return masks
+    
+    def infer(self, input):
+        return self.model.infer(input)
+    
+    def postprocess_masks(self, masks, input_size, original_size):
+        return self.model.postprocess_masks(masks, input_size, original_size)
+    
+    def backward_G(self):
+        self.model.backward_G()
+        self.loss_G = self.model.loss_G
+    
+    def optimize_parameters(self):
+        self.model.optimize_parameters()
+    
+    def set_requires_grad(self, nets, requires_grad=False):
+        self.model.set_requires_grad(nets, requires_grad)
+    
+    def __getattr__(self, name):
+        """转发未找到的属性到内部模型"""
+        if name == 'model':
+            return super().__getattr__(name)
+        return getattr(self.model, name)
