@@ -117,6 +117,301 @@ class PositionEmbeddingRandom(nn.Module):
         pe = self._pe_encoding(torch.stack([x_embed, y_embed], dim=-1))
         return pe.permute(2, 0, 1)  # C x H x W
 
+@register('sam_moe_3b_multitask')
+class SAM_MOE_3B_MultiTask(nn.Module):
+    """支持多任务的SAM MOE 3B模型"""
+    
+    def __init__(
+        self,
+        inp_size=None,
+        encoder_mode=None,
+        loss=None,
+        task_configs=None,
+        ignore_index=-100,
+    ):
+        super().__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.embed_dim = encoder_mode['embed_dim']
+        self.prompt_embed_dim = encoder_mode['prompt_embed_dim']
+        self.inp_size = inp_size
+        self.image_embedding_size = inp_size // encoder_mode['patch_size']
+        
+        # 共享的图像编码器
+        self.image_encoder = ImageEncoderViT_moe_layer(
+            img_size=inp_size,
+            patch_size=encoder_mode['patch_size'],
+            in_chans=3,
+            embed_dim=encoder_mode['embed_dim'],
+            depth=encoder_mode['depth'],
+            num_heads=encoder_mode['num_heads'],
+            mlp_ratio=encoder_mode['mlp_ratio'],
+            out_chans=encoder_mode['out_chans'],
+            qkv_bias=encoder_mode['qkv_bias'],
+            norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+            act_layer=nn.GELU,
+            use_rel_pos=encoder_mode['use_rel_pos'],
+            rel_pos_zero_init=True,
+            window_size=encoder_mode['window_size'],
+            global_attn_indexes=encoder_mode['global_attn_indexes'],
+            moe_num_experts=16,
+            moe_k=4,
+            moe_noisy_gating=True,
+            moe_start_layer_index=28
+        )
+
+        # 为每个任务创建独立的mask_decoder
+        self.task_configs = task_configs
+        self.mask_decoders = nn.ModuleDict()
+        
+        for task_config in task_configs:
+            task_id_str = str(task_config['task_id'])
+            self.mask_decoders[task_id_str] = MaskDecoder(
+                num_multimask_outputs=3,
+                transformer=TwoWayTransformer_moe(
+                    depth=2,
+                    embedding_dim=self.prompt_embed_dim,
+                    mlp_dim=2048,
+                    num_heads=8,
+                ),
+                transformer_dim=self.prompt_embed_dim,
+                iou_head_depth=3,
+                iou_head_hidden_dim=256,
+                num_classes=task_config['num_classes'],
+            )
+
+        # 为每个任务设置不同的损失函数
+        self.loss_mode = loss
+        self.ignore_index = ignore_index
+        self.loss_functions = {}
+        self.task_configs = task_configs  # 保存配置用于后续设备设置
+        
+        for task_config in task_configs:
+            task_id = task_config['task_id']
+            
+            if loss == 'iou':
+                if task_config.get('loss_weight') is not None:
+                    pos_weight = torch.tensor(task_config['loss_weight'], dtype=torch.float)
+                    # 先不移动到设备，等模型移动到CUDA后再处理
+                    self.loss_functions[task_id] = torch.nn.CrossEntropyLoss(
+                        weight=pos_weight, ignore_index=ignore_index
+                    )
+                else:
+                    self.loss_functions[task_id] = torch.nn.CrossEntropyLoss(
+                        ignore_index=ignore_index
+                    )
+            elif loss == 'bce':
+                self.loss_functions[task_id] = torch.nn.BCEWithLogitsLoss(reduction='none')
+            elif loss == 'bbce':
+                self.loss_functions[task_id] = BBCEWithLogitLoss()
+
+        # 位置编码
+        self.pe_layer = PositionEmbeddingRandom(encoder_mode['prompt_embed_dim'] // 2)
+        self.no_mask_embed = nn.Embedding(1, encoder_mode['prompt_embed_dim'])
+
+        # EVP相关的参数冻结
+        if 'evp' in encoder_mode['name']:
+            for k, p in self.named_parameters():
+                if (
+                    "prompt" not in k
+                    and "mask_decoder" not in k
+                    and "prompt_encoder" not in k
+                ):
+                    p.requires_grad = False
+
+    def cuda(self, device=None):
+        """重写cuda方法，确保损失函数也移动到GPU"""
+        super().cuda(device)
+        # 确保损失函数也移动到CUDA
+        if hasattr(self, 'loss_functions'):
+            for loss_fn in self.loss_functions.values():
+                loss_fn.cuda(device)
+        return self
+    
+    def to(self, device):
+        """重写to方法，确保损失函数也移动到指定设备"""
+        super().to(device)
+        self.device = device
+        # 确保损失函数也移动到指定设备
+        if hasattr(self, 'loss_functions'):
+            for loss_fn in self.loss_functions.values():
+                loss_fn.to(device)
+        return self
+
+    def set_input(self, input, gt_mask, task_ids):
+        """设置输入数据，包括任务ID"""
+        self.input = input.to(self.device)
+        self.gt_mask = gt_mask.to(self.device)
+        self.task_ids = task_ids.to(self.device) if not isinstance(task_ids, torch.Tensor) else task_ids.to(self.device)
+
+    def get_dense_pe(self) -> torch.Tensor:
+        """获取密集位置编码"""
+        return self.pe_layer(self.image_embedding_size).unsqueeze(0)
+
+    def forward(self):
+        """前向传播 - 支持混合任务批次"""
+        bs = self.input.shape[0]
+        
+        # 1. 共享特征提取
+        self.features = self.image_encoder(self.input)
+        
+        # 2. 找到最大类别数用于padding
+        max_classes = 0
+        for config in self.task_configs:
+            max_classes = max(max_classes, config['num_classes'])
+        
+        # 3. 根据任务ID路由到不同的解码头 - 直接构建最终tensor
+        pred_masks_list = []
+        
+        for i in range(bs):
+            task_id = int(self.task_ids[i].item()) if hasattr(self.task_ids[i], 'item') else int(self.task_ids[i])
+            task_id_str = str(task_id)
+            
+            # 获取对应任务的解码器
+            mask_decoder = self.mask_decoders[task_id_str]
+            
+            # 单样本推理
+            sparse_embeddings = torch.empty((1, 0, self.prompt_embed_dim), device=self.input.device)
+            dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+                1, -1, self.image_embedding_size, self.image_embedding_size
+            )
+            
+            low_res_masks, _ = mask_decoder(
+                image_embeddings=self.features[i:i+1],
+                image_pe=self.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=False,
+            )
+            
+            # 后处理
+            masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
+            
+            # 获取当前任务的实际类别数
+            actual_classes = masks.shape[1]
+            
+            # 如果当前任务的类别数少于最大值，进行padding
+            if actual_classes < max_classes:
+                padding_size = max_classes - actual_classes
+                padding = torch.zeros(1, padding_size, masks.shape[2], masks.shape[3], 
+                                    device=masks.device, dtype=masks.dtype)
+                masks = torch.cat([masks, padding], dim=1)
+            
+            pred_masks_list.append(masks)
+        
+        # 将所有预测结果拼接（现在都有相同的类别数） - 避免额外存储
+        self.pred_mask = torch.cat(pred_masks_list, dim=0)
+        del pred_masks_list  # 显式删除临时列表释放内存
+
+    def infer(self, input, task_id=0):
+        """推理时指定单一任务ID"""
+        bs = input.shape[0]
+        task_id_str = str(task_id)
+        
+        # 共享特征提取
+        features = self.image_encoder(input)
+        
+        # 获取对应任务的解码器
+        mask_decoder = self.mask_decoders[task_id_str]
+        
+        sparse_embeddings = torch.empty((bs, 0, self.prompt_embed_dim), device=input.device)
+        dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+            bs, -1, self.image_embedding_size, self.image_embedding_size
+        )
+        
+        # 推理时不需要存储iou_predictions，节省显存
+        low_res_masks, _ = mask_decoder(
+            image_embeddings=features,
+            image_pe=self.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=False,
+        )
+        
+        masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
+        return masks
+
+    def postprocess_masks(
+        self,
+        masks: torch.Tensor,
+        input_size: Tuple[int, ...],
+        original_size: Tuple[int, ...],
+    ) -> torch.Tensor:
+        """后处理mask"""
+        masks = masks.squeeze(dim=1)
+        masks = F.interpolate(
+            masks,
+            (self.image_encoder.img_size, self.image_encoder.img_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        masks = masks[..., :input_size, :input_size]
+        masks = F.interpolate(
+            masks, original_size, mode="bilinear", align_corners=False
+        )
+        return masks
+
+    def backward_G(self):
+        """计算多任务损失"""
+        total_loss = 0
+        bs = self.input.shape[0]
+        
+        # 按任务ID分组计算损失
+        unique_task_ids = torch.unique(self.task_ids)
+        
+        for task_id_tensor in unique_task_ids:
+            task_id = int(task_id_tensor.item()) if hasattr(task_id_tensor, 'item') else int(task_id_tensor)
+            
+            # 找到当前任务的样本索引
+            indices = (self.task_ids == task_id).nonzero(as_tuple=True)[0]
+            
+            if len(indices) > 0:
+                # 获取当前任务的预测和真实标签
+                task_pred = self.pred_mask[indices]
+                task_gt = self.gt_mask[indices]
+                
+                # 获取当前任务的实际类别数
+                task_config = None
+                for config in self.task_configs:
+                    if config['task_id'] == task_id:
+                        task_config = config
+                        break
+                
+                if task_config is not None:
+                    actual_num_classes = task_config['num_classes']
+                    # 只使用实际类别数的部分，忽略padding
+                    task_pred = task_pred[:, :actual_num_classes]
+                    task_gt = task_gt[:, :actual_num_classes]
+                
+                # 使用对应任务的损失函数
+                loss_fn = self.loss_functions[task_id]
+                
+                if self.loss_mode == 'iou':
+                    task_loss = loss_fn(task_pred, torch.argmax(task_gt, dim=1))
+                else:
+                    task_loss = loss_fn(task_pred, task_gt)
+                
+                total_loss += task_loss
+        
+        self.loss_G = total_loss
+        self.loss_G.backward()
+
+    def optimize_parameters(self):
+        """优化参数"""
+        self.forward()
+        self.optimizer.zero_grad()
+        self.backward_G()
+        self.optimizer.step()
+
+    def set_requires_grad(self, nets, requires_grad=False):
+        """设置网络的梯度需求"""
+        if not isinstance(nets, list):
+            nets = [nets]
+        for net in nets:
+            if net is not None:
+                for param in net.parameters():
+                    param.requires_grad = requires_grad
+
+
 @register('sam_moe_3b')
 class SAM_MOE_3B(nn.Module):
     def __init__(

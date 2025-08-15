@@ -107,9 +107,120 @@ def make_data_loader(spec, tag=''):
     return loader
 
 
+def multi_task_collate_fn(batch):
+    """自定义collate函数，处理不同类别数量的多任务数据"""
+    # 按任务ID分组
+    task_groups = {}
+    for item in batch:
+        task_id = item['task_id'].item() if hasattr(item['task_id'], 'item') else item['task_id']
+        if task_id not in task_groups:
+            task_groups[task_id] = []
+        task_groups[task_id].append(item)
+    
+    # 找到最大的类别数，用于padding
+    max_classes = 0
+    for task_id, task_items in task_groups.items():
+        num_classes = task_items[0]['gt'].shape[0]
+        max_classes = max(max_classes, num_classes)
+    
+    # 为每个任务创建独立的batch并padding到相同大小
+    batched_data = {'inp': [], 'gt': [], 'task_id': []}
+    
+    for task_id, task_items in task_groups.items():
+        # 堆叠同一任务的数据
+        task_inp = torch.stack([item['inp'] for item in task_items])
+        task_gt = torch.stack([item['gt'] for item in task_items])
+        task_ids = torch.tensor([task_id] * len(task_items))
+        
+        # 如果当前任务的类别数少于最大值，进行padding
+        current_classes = task_gt.shape[1]
+        if current_classes < max_classes:
+            padding_size = max_classes - current_classes
+            padding = torch.zeros(task_gt.shape[0], padding_size, task_gt.shape[2], task_gt.shape[3])
+            task_gt = torch.cat([task_gt, padding], dim=1)
+        
+        batched_data['inp'].append(task_inp)
+        batched_data['gt'].append(task_gt)
+        batched_data['task_id'].append(task_ids)
+    
+    # 将不同任务的数据连接起来
+    final_inp = torch.cat(batched_data['inp'], dim=0)
+    final_gt = torch.cat(batched_data['gt'], dim=0)
+    final_task_ids = torch.cat(batched_data['task_id'], dim=0)
+    
+    return {
+        'inp': final_inp,
+        'gt': final_gt,
+        'task_id': final_task_ids
+    }
+
+
+def make_multi_data_loader(datasets_config, tag=''):
+    """创建多任务数据加载器"""
+    if datasets_config is None:
+        return None
+    
+    all_datasets = []
+    total_size = 0
+    batch_size = 1  # 默认batch_size
+    
+    for dataset_config in datasets_config:
+        dataset = datasets.make(dataset_config['dataset'])
+        dataset = datasets.make(dataset_config['wrapper'], args={'dataset': dataset})
+        all_datasets.append(dataset)
+        total_size += len(dataset)
+        
+        # 获取batch_size（如果配置了的话）
+        if 'batch_size' in dataset_config:
+            batch_size = dataset_config['batch_size']
+        
+        if local_rank == 0:
+            log('{} dataset (task_id={}): size={}'.format(
+                tag, dataset_config['dataset']['args'].get('task_id', 'unknown'), len(dataset)))
+            
+            # 显示第一个样本的信息
+            sample = dataset[0]
+            for k, v in sample.items():
+                if hasattr(v, 'shape'):
+                    log('  {}: shape={}'.format(k, tuple(v.shape)))
+                else:
+                    log('  {}: {}'.format(k, v))
+    
+    # 合并多个数据集
+    combined_dataset = torch.utils.data.ConcatDataset(all_datasets)
+    
+    if local_rank == 0:
+        log('{} combined dataset: total_size={}, batch_size={}'.format(tag, total_size, batch_size))
+    
+    sampler = torch.utils.data.distributed.DistributedSampler(combined_dataset)
+    loader = DataLoader(
+        combined_dataset, 
+        batch_size=batch_size,  # 使用可配置的batch_size
+        shuffle=False, 
+        num_workers=4, 
+        pin_memory=False, 
+        sampler=sampler,
+        collate_fn=multi_task_collate_fn  # 使用自定义collate函数
+    )
+    return loader
+
+
 def make_data_loaders():
-    train_loader = make_data_loader(config.get('train_dataset'), tag='train')
-    val_loader = make_data_loader(config.get('val_dataset'), tag='val')
+    # 检查是否使用多任务配置
+    if 'train_datasets' in config:
+        # 多任务配置
+        train_loader = make_multi_data_loader(config.get('train_datasets'), tag='train')
+    else:
+        # 单任务配置（向后兼容）
+        train_loader = make_data_loader(config.get('train_dataset'), tag='train')
+    
+    if 'val_datasets' in config:
+        # 多任务验证配置
+        val_loader = make_multi_data_loader(config.get('val_datasets'), tag='val')
+    else:
+        # 单任务验证配置（向后兼容）
+        val_loader = make_data_loader(config.get('val_dataset'), tag='val')
+    
     return train_loader, val_loader
 
 def eval_psnr(loader, model, config):
@@ -122,8 +233,23 @@ def eval_psnr(loader, model, config):
     
     model.eval()
     eval_type = config.get('eval_type')
-    class_num = config['model']['args']['num_classes']
-    ignore_background = config['val_dataset']['dataset']['args']['ignore_bg']
+    
+    # 处理多任务和单任务的num_classes获取
+    if 'task_configs' in config['model']['args']:
+        # 多任务模型：使用所有任务中的最大类别数
+        task_configs = config['model']['args']['task_configs']
+        class_num = max(task_config['num_classes'] for task_config in task_configs)
+    else:
+        # 单任务模型：直接获取num_classes
+        class_num = config['model']['args']['num_classes']
+    
+    # 处理多任务和单任务的ignore_bg获取
+    if 'val_datasets' in config:
+        # 多任务配置：使用第一个数据集的ignore_bg设置
+        ignore_background = config['val_datasets'][0]['dataset']['args']['ignore_bg']
+    else:
+        # 单任务配置：使用原始方式
+        ignore_background = config['val_dataset']['dataset']['args']['ignore_bg']
     if eval_type == 'f1':
         metric_fn = utils.calc_f1
         metric1, metric2, metric3, metric4 = 'f1', 'auc', 'none', 'none'
@@ -176,7 +302,13 @@ def eval_psnr(loader, model, config):
         inp = batch['inp']
 
         with torch.no_grad():
-            output_masks = model.infer(inp)
+            # 检查是否为多任务模型
+            if 'task_id' in batch:
+                task_id = batch['task_id'][0].item()  # 获取任务ID
+                output_masks = model.infer(inp, task_id=task_id)
+            else:
+                # 单任务模式，向后兼容
+                output_masks = model.infer(inp)
             pred = torch.sigmoid(output_masks)
         
         # 计算当前批次的指标
@@ -256,7 +388,14 @@ def eval_psnr(loader, model, config):
         fwIOU = metric_seg.Frequency_Weighted_Intersection_over_Union()
         fwIOU = np.around(fwIOU, decimals=4)
         
-        classes_list = config['train_dataset']['dataset']['args']['classes']
+        # 处理多任务和单任务的classes获取
+        if 'train_datasets' in config:
+            # 多任务配置：使用第一个数据集的classes
+            classes_list = config['train_datasets'][0]['dataset']['args']['classes']
+        else:
+            # 单任务配置：使用原始方式
+            classes_list = config['train_dataset']['dataset']['args']['classes']
+            
         if ignore_background:
             axis_labels = classes_list[:-1] 
         else: 
@@ -404,7 +543,15 @@ def train(train_loader, model):
             batch[k] = v.to(device)
         inp = batch['inp']
         gt = batch['gt']
-        model.set_input(inp, gt)
+        
+        # 检查是否包含task_id
+        if 'task_id' in batch:
+            task_ids = batch['task_id']
+            model.set_input(inp, gt, task_ids)
+        else:
+            # 单任务模式，向后兼容
+            model.set_input(inp, gt)
+            
         model.optimize_parameters()
         batch_loss = [
             torch.zeros_like(model.loss_G) for _ in range(dist.get_world_size())

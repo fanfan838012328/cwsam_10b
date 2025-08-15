@@ -1,2 +1,4 @@
 *.pyc
 /save
+/inf_res
+/dinov3-main

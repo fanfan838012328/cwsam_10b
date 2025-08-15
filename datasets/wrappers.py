@@ -109,7 +109,51 @@ class ValDataset(Dataset):
         return {
             'inp': img,
             'gt': mask,
+            'task_id': 0  # 原始数据集默认task_id为0
             # 'file_name': filename
+        }
+
+
+@register('val_multitask')
+class ValMultiTaskDataset(Dataset):
+    """支持多任务的验证数据集包装器"""
+    
+    def __init__(self, dataset, inp_size=None, augment=False,**kwargs):
+        self.dataset = dataset
+        self.inp_size = inp_size
+        self.augment = augment
+
+        self.img_transform = transforms.Compose([
+                transforms.Resize((inp_size, inp_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+            ])
+        self.mask_transform = transforms.Compose([
+                transforms.Resize((inp_size, inp_size), interpolation=Image.NEAREST),
+                transforms.ToTensor(),
+            ])
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        img, mask, _, task_id = self.dataset[idx]  # 获取任务ID
+        
+        # 确保 img 和 mask 都是 PIL.Image 对象
+        if not isinstance(img, Image.Image):
+            raise TypeError(f"Expected PIL.Image for img, got {type(img)}")
+        if not isinstance(mask, Image.Image):
+            raise TypeError(f"Expected PIL.Image for mask, got {type(mask)}")
+        
+        img = self.img_transform(img)
+        mask = self.mask_transform(mask)
+        mask = mask_to_onehot(mask, self.dataset.palette)
+    
+        return {
+            'inp': img,
+            'gt': mask,
+            'task_id': task_id
         }
 @register('test')
 class TestDataset(Dataset):
@@ -202,7 +246,58 @@ class TrainDataset(Dataset):
         return {
             'inp': self.img_transform(img),
             #'gt': self.mask_transform(mask)
-            'gt': mask
+            'gt': mask,
+            'task_id': 0  # 原始数据集默认task_id为0
+        }
+
+
+@register('train_multitask')
+class TrainMultiTaskDataset(Dataset):
+    """支持多任务的训练数据集包装器"""
+    
+    def __init__(self, dataset, size_min=None, size_max=None, inp_size=None,
+                 augment=False, gt_resize=None):
+        self.dataset = dataset
+        self.size_min = size_min
+        if size_max is None:
+            size_max = size_min
+        self.size_max = size_max
+        self.augment = augment
+        self.gt_resize = gt_resize
+
+        self.inp_size = inp_size
+        self.img_transform = transforms.Compose([
+                transforms.Resize((self.inp_size, self.inp_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+            ])
+        self.inverse_transform = transforms.Compose([
+                transforms.Normalize(mean=[0., 0., 0.],
+                                     std=[1/0.229, 1/0.224, 1/0.225]),
+                transforms.Normalize(mean=[-0.485, -0.456, -0.406],
+                                     std=[1, 1, 1])
+            ])
+        self.mask_transform = transforms.Compose([
+                transforms.Resize((self.inp_size, self.inp_size)),
+                transforms.ToTensor(),
+            ])
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        img, mask, _, task_id = self.dataset[idx]  # 获取任务ID
+
+        img = transforms.Resize((self.inp_size, self.inp_size))(img)
+        mask = transforms.Resize((self.inp_size, self.inp_size), interpolation=InterpolationMode.NEAREST)(mask)
+        mask = self.mask_transform(mask)
+        mask = mask_to_onehot(mask, self.dataset.palette)
+
+        return {
+            'inp': self.img_transform(img),
+            'gt': mask,
+            'task_id': task_id
         }
 
 
