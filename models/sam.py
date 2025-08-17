@@ -340,7 +340,7 @@ class SAM_MOE_3B_MultiTask(nn.Module):
         masks = masks.squeeze(dim=1)
         masks = F.interpolate(
             masks,
-            (self.image_encoder.img_size, self.image_encoder.img_size),
+            (self.inp_size, self.inp_size),
             mode="bilinear",
             align_corners=False,
         )
@@ -425,27 +425,19 @@ class SAM_MOE_3B(nn.Module):
     ):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.embed_dim = encoder_mode['embed_dim']
-        self.image_encoder = ImageEncoderViT_moe_layer(
-            img_size=inp_size,
-            patch_size=encoder_mode['patch_size'],
-            in_chans=3,
-            embed_dim=encoder_mode['embed_dim'],
-            depth=encoder_mode['depth'],
-            num_heads=encoder_mode['num_heads'],
-            mlp_ratio=encoder_mode['mlp_ratio'],
-            out_chans=encoder_mode['out_chans'],
-            qkv_bias=encoder_mode['qkv_bias'],
-            norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
-            act_layer=nn.GELU,
-            use_rel_pos=encoder_mode['use_rel_pos'],
-            rel_pos_zero_init=True,
-            window_size=encoder_mode['window_size'],
-            global_attn_indexes=encoder_mode['global_attn_indexes'],
-            moe_num_experts=16,
-            moe_k=4,
-            moe_noisy_gating=True,
-            moe_start_layer_index=28
+        # User needs to download the weights from https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/
+        # and provide the local path here.
+        weights_path = '/mnt/fanfq/data/fan/weights/dinov3_vit7b16_pretrain_sat493m-a6675841.pth'
+        self.image_encoder = torch.hub.load('dinov3-main', 'dinov3_vit7b16', source='local', weights=weights_path)
+        # This is a placeholder value for ViT-7B hidden dimension.
+        # You can get the correct value by inspecting `model.config.hidden_size` after loading the model.
+        dinov3_hidden_dim = 4096
+        # Use a safe power-of-2 intermediate dimension to avoid potential numerical issues
+        mid_dim = 1024  # Safe intermediate dimension
+        self.projection = nn.Sequential(
+            nn.Conv2d(dinov3_hidden_dim, mid_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(mid_dim, encoder_mode['prompt_embed_dim'], kernel_size=1)
         )
         self.prompt_embed_dim = encoder_mode['prompt_embed_dim']
         self.mask_decoder = MaskDecoder(
@@ -504,7 +496,7 @@ class SAM_MOE_3B(nn.Module):
         self.image_embedding_size = inp_size // encoder_mode['patch_size']
         self.no_mask_embed = nn.Embedding(1, encoder_mode['prompt_embed_dim'])
 
-    def set_input(self, input, gt_mask):
+    def set_input(self, input, gt_mask, task_ids=None):
         self.input = input.to(self.device)
         self.gt_mask = gt_mask.to(self.device)
 
@@ -527,18 +519,29 @@ class SAM_MOE_3B(nn.Module):
         sparse_embeddings = torch.empty(
             (bs, 0, self.prompt_embed_dim), device=self.input.device
         )
-        dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
-            bs, -1, self.image_embedding_size, self.image_embedding_size
-        )
+        dino_features = self.image_encoder.forward_features(self.input)['x_norm_patchtokens']
 
-        self.features = self.image_encoder(self.input)
+        # Derive grid size from token count to be robust at eval
+        token_count = dino_features.shape[1]
+        h = int(math.isqrt(token_count))
+        if h * h != token_count:
+            h = int(round(token_count ** 0.5))
+        if h * h != token_count:
+            raise RuntimeError(f"Unexpected token_count={token_count}, cannot form square grid.")
+        w = h
+        dino_features = dino_features.permute(0, 2, 1).reshape(bs, -1, h, w)
+
+        self.features = self.projection(dino_features)
+
 
         # Predict masks
         low_res_masks, iou_predictions = self.mask_decoder(
             image_embeddings=self.features,
-            image_pe=self.get_dense_pe(),
+            image_pe=self.pe_layer(h).unsqueeze(0),
             sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
+            dense_prompt_embeddings=self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+                bs, -1, h, w
+            ),
             multimask_output=False,
         )
 
@@ -546,25 +549,35 @@ class SAM_MOE_3B(nn.Module):
         masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
         self.pred_mask = masks
 
-    def infer(self, input):
-        bs = 1
+    def infer(self, input, task_id=None):
+        bs = input.shape[0]
 
         # Embed prompts
         sparse_embeddings = torch.empty(
             (bs, 0, self.prompt_embed_dim), device=input.device
         )
-        dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
-            bs, -1, self.image_embedding_size, self.image_embedding_size
-        )
+        dino_features = self.image_encoder.forward_features(input)['x_norm_patchtokens']
 
-        self.features = self.image_encoder(input)  # 第一个val 第二张图推理循环 显存+5G
+        # Derive grid size from token count to be robust at eval
+        token_count = dino_features.shape[1]
+        h = int(math.isqrt(token_count))
+        if h * h != token_count:
+            h = int(round(token_count ** 0.5))
+        if h * h != token_count:
+            raise RuntimeError(f"Unexpected token_count={token_count}, cannot form square grid.")
+        w = h
+        dino_features = dino_features.permute(0, 2, 1).reshape(bs, -1, h, w)
+
+        self.features = self.projection(dino_features)
 
         # Predict masks
         low_res_masks, iou_predictions = self.mask_decoder(
             image_embeddings=self.features,
-            image_pe=self.get_dense_pe(),
+            image_pe=self.pe_layer(h).unsqueeze(0),
             sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
+            dense_prompt_embeddings=self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+                bs, -1, h, w
+            ),
             multimask_output=False,
         )
 
@@ -598,7 +611,7 @@ class SAM_MOE_3B(nn.Module):
         masks = masks.squeeze(dim=1)
         masks = F.interpolate(
             masks,
-            (self.image_encoder.img_size, self.image_encoder.img_size),
+            (self.inp_size, self.inp_size),
             mode="bilinear",
             align_corners=False,
         )
