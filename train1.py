@@ -36,6 +36,21 @@ import torch.multiprocessing
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
+# Hopper(H20) 优化：开启 TF32 / SDPA 并启用 cudnn benchmark
+try:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    if hasattr(torch, 'set_float32_matmul_precision'):
+        torch.set_float32_matmul_precision('high')
+    try:
+        from torch.backends.cuda import sdp_kernel
+        sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True)
+    except Exception:
+        pass
+except Exception:
+    pass
+
 
 def print_memory_usage(stage=""):
     """打印当前内存使用情况"""
@@ -301,7 +316,7 @@ def eval_psnr(loader, model, config):
             if 'filename' in batch:
                 filename_info = f", filename: {batch['filename'][0]}" # 只打印batch中第一个文件名
             
-            log(f"[Rank {local_rank}] Processing batch {i}/{len(loader)}{filename_info}")
+            # log(f"[Rank {local_rank}] Processing batch {i}/{len(loader)}{filename_info}")
 
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
@@ -316,7 +331,8 @@ def eval_psnr(loader, model, config):
                 else:
                     output_masks = model.infer(inp)
                 
-                pred = torch.sigmoid(output_masks)
+                # 多类分割使用 softmax 概率
+                pred = torch.softmax(output_masks, dim=1)
 
             # metric_fn的计算可以保留，因为Averager是非分布式聚合的
             if eval_type != 'seg':
@@ -546,7 +562,7 @@ def prepare_training():
     print_memory_usage("模型创建后，DDP转换前")
     
     # 先将模型转换为 DDP
-    model = model.cuda()
+    model = model.cuda().to(memory_format=torch.channels_last)
     print_memory_usage("模型移至GPU后")
     
     model = torch.nn.parallel.DistributedDataParallel(
@@ -618,7 +634,12 @@ def train(train_loader, model):
     loss_list = []
     for batch in train_loader:
         for k, v in batch.items():
-            batch[k] = v.to(device)
+            # channels_last + 非阻塞拷贝
+            if isinstance(v, torch.Tensor):
+                v = v.to(device, non_blocking=True)
+                if v.dim() == 4:
+                    v = v.to(memory_format=torch.channels_last)
+            batch[k] = v
         inp = batch['inp']
         gt = batch['gt']
         
@@ -630,7 +651,9 @@ def train(train_loader, model):
             # 单任务模式，向后兼容
             model.set_input(inp, gt)
             
-        model.optimize_parameters()
+        # BF16 autocast 加速
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            model.optimize_parameters()
         batch_loss = [
             torch.zeros_like(model.loss_G) for _ in range(dist.get_world_size())
         ]
@@ -688,7 +711,7 @@ def main(config_, save_path, args):
         model.optimizer, config['epoch_max'], eta_min=config.get('lr_min')
     )
 
-    model = model.cuda()
+    model = model.cuda().to(memory_format=torch.channels_last)
     model = torch.nn.parallel.DistributedDataParallel(
         model,
         device_ids=[args.local_rank],
@@ -698,32 +721,48 @@ def main(config_, save_path, args):
     )
     model = model.module
 
-    # 1. 首先将所有参数设置为需要梯度
+    # 精确控制可训练参数：默认全部冻结，仅训练 LoRA + 投影 + 解码头
     for param in model.parameters():
-        param.requires_grad = True
+        param.requires_grad = False
 
-    # 2. 加载DINOv2预训练权重（这步是在模型内部完成的），我们获取其state_dict的keys
-    # 注意：这里的dino_checkpoint_path需要和你模型定义中的路径一致
-    dino_checkpoint_path = '/mnt/fanfq/data/fan/weights/dinov3_vit7b16_pretrain_sat493m-a6675841.pth'
-    dino_state_dict = torch.load(dino_checkpoint_path)
+    # 启用 LoRA 参数（LoRA 模块 + w_a/w_b 列表）
+    try:
+        from models.lora import LoRA as LoRAModule
+    except Exception:
+        LoRAModule = None
 
-    # 3. 冻结与预训练权重名称和形状都匹配的 image_encoder 部分
-    for name, param in model.image_encoder.named_parameters():
-        if name in dino_state_dict and param.shape == dino_state_dict[name].shape:
-            param.requires_grad = False
-            if local_rank == 0:
-                log(f'Froze parameter: {name} (name and shape matched)')
-        else:
-            if local_rank == 0:
-                if name in dino_state_dict:
-                    log(
-                        f'Kept parameter trainable: {name} (shape mismatch: model {param.shape} vs ckpt {dino_state_dict[name].shape})'
-                    )
-                else:
-                    log(f'Kept parameter trainable: {name} (not in checkpoint)')
+    if LoRAModule is not None:
+        for module in model.modules():
+            if isinstance(module, LoRAModule):
+                # 仅训练 LoRA 低秩矩阵，显式关闭原始 qkv 参数
+                for name, p in module.named_parameters():
+                    if name.startswith('qkv.'):
+                        p.requires_grad = False
+                    else:
+                        p.requires_grad = True
 
-    # 清理内存
-    del dino_state_dict
+    if hasattr(model, 'image_encoder'):
+        # DINOV3EncoderLoRA 中的 w_a/w_b 列表
+        if hasattr(model.image_encoder, 'w_a'):
+            for lin in model.image_encoder.w_a:
+                for p in lin.parameters():
+                    p.requires_grad = True
+        if hasattr(model.image_encoder, 'w_b'):
+            for lin in model.image_encoder.w_b:
+                for p in lin.parameters():
+                    p.requires_grad = True
+
+    # 启用 projection 和 解码头（单任务 mask_decoder / 多任务 mask_decoders）以及位置/无掩码嵌入
+    for name, p in model.named_parameters():
+        if (
+            name.startswith('projection')
+            or name.startswith('mask_decoder')
+            or '.mask_decoders.' in name
+            or name.startswith('no_mask_embed')
+            or name.startswith('pe_layer')
+        ):
+            p.requires_grad = True
+
     cleanup_memory()
 
     if local_rank == 0:

@@ -26,7 +26,7 @@ train_dataset:
     args:
       inp_size: 512
       augment: false
-  batch_size: 8
+  batch_size: 10
 
 val_dataset:
   dataset:
@@ -136,12 +136,13 @@ model:
       - 15
       - 23
       - 31
+      lora_r: 16
 optimizer:
   name: adamw 
   args:
     lr: 0.0002
 lr_min: 1.0e-7
-epoch_max: 200
+epoch_max: 100
 
 
 

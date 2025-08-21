@@ -28,19 +28,19 @@ def prepare_image(image_path, input_size=512):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', 
-                       default='/mnt/fanfq/project/code/cwsam_10b/configs/multitask/sam_optimized_multitask.yaml', 
+                       default='/mnt/fanfq/project/code/cwsam_10b/configs/XinTong/XinTong_sam_vit_h_moe_3b.yaml', 
                        help='配置文件路径')
     parser.add_argument('--model', 
-                       default='/mnt/fanfq/project/code/cwsam_10b/save/cwsam_multitask_optimized_batch12/model_epoch_22.pth',
+                       default='/mnt/fanfq/project/code/cwsam_10b/save/cwsam_dinov3_b8_nomoe/model_epoch_12.pth',
                        help='模型权重路径')
     parser.add_argument('--input_dir', 
                        default='/mnt/fanfq/data/fan/data/dataset/XinTong512_new/val/images',
                        help='输入图像文件夹')
     parser.add_argument('--output_dir', 
-                       default='/mnt/fanfq/project/code/cwsam_10b/inf_res/e22_0',
+                       default='/mnt/fanfq/project/code/cwsam_10b/inf_res/dinov3_e12',
                        help='输出结果文件夹')
     parser.add_argument('--device', 
-                       default='cuda',
+                       default='cuda:2',
                        choices=['cuda', 'cpu'],
                        help='选择推理设备 (cuda/cpu)')
     parser.add_argument('--task_id', 
@@ -100,12 +100,25 @@ def main():
     checkpoint = torch.load(args.model, map_location=device)
     
     # 处理不同格式的checkpoint
-    if 'model_state_dict' in checkpoint:
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         # 训练时保存的checkpoint格式
         model_state_dict = checkpoint['model_state_dict']
+    elif isinstance(checkpoint, dict) and 'model' in checkpoint:
+        # 从checkpoint['model']中提取权重
+        model_state_dict = checkpoint['model']
+    elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+        # 常见命名：'state_dict'
+        model_state_dict = checkpoint['state_dict']
     else:
         # 直接保存的模型状态字典
         model_state_dict = checkpoint
+
+    # 常见DDP/Lightning前缀清理
+    if isinstance(model_state_dict, dict):
+        if any(k.startswith('module.') for k in model_state_dict.keys()):
+            model_state_dict = {k[len('module.'):]: v for k, v in model_state_dict.items()}
+        if any(k.startswith('model.') for k in model_state_dict.keys()):
+            model_state_dict = {k[len('model.'):]: v for k, v in model_state_dict.items()}
     
     # 加载模型权重，使用strict=False来忽略不匹配的键
     missing_keys, unexpected_keys = model.load_state_dict(model_state_dict, strict=False)

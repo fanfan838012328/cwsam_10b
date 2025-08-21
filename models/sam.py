@@ -15,10 +15,11 @@ from models import register
 from .mmseg.models.sam import (
 
     MaskDecoder,
-    TwoWayTransformer_moe,
+    TwoWayTransformer,
     ImageEncoderViT_moe_layer,
 
 )
+from .dinov3_lora import DINOV3EncoderLoRA
 
 logger = logging.getLogger(__name__)
 from .iou_loss import IOU
@@ -167,7 +168,7 @@ class SAM_MOE_3B_MultiTask(nn.Module):
             task_id_str = str(task_config['task_id'])
             self.mask_decoders[task_id_str] = MaskDecoder(
                 num_multimask_outputs=3,
-                transformer=TwoWayTransformer_moe(
+                transformer=TwoWayTransformer(
                     depth=2,
                     embedding_dim=self.prompt_embed_dim,
                     mlp_dim=2048,
@@ -283,6 +284,9 @@ class SAM_MOE_3B_MultiTask(nn.Module):
                 multimask_output=False,
             )
             
+            # 选择第一个 mask token 的输出：(1, 4, 33, h, w) -> (1, 33, h, w)
+            low_res_masks = low_res_masks[:, 0]  # 取第一个 mask
+            
             # 后处理
             masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
             
@@ -326,6 +330,9 @@ class SAM_MOE_3B_MultiTask(nn.Module):
             dense_prompt_embeddings=dense_embeddings,
             multimask_output=False,
         )
+        
+        # 选择第一个 mask token 的输出：(bs, 4, 33, h, w) -> (bs, 33, h, w)
+        low_res_masks = low_res_masks[:, 0]  # 取第一个 mask
         
         masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
         return masks
@@ -429,6 +436,14 @@ class SAM_MOE_3B(nn.Module):
         # and provide the local path here.
         weights_path = '/mnt/fanfq/data/fan/weights/dinov3_vit7b16_pretrain_sat493m-a6675841.pth'
         self.image_encoder = torch.hub.load('dinov3-main', 'dinov3_vit7b16', source='local', weights=weights_path)
+        # Wrap DINOv3 encoder with LoRA for finetuning
+        try:
+            lora_r = encoder_mode.get('lora_r', 32) if isinstance(encoder_mode, dict) else 32
+            lora_layers = encoder_mode.get('lora_layers', None) if isinstance(encoder_mode, dict) else None
+            self.image_encoder = DINOV3EncoderLoRA(self.image_encoder, r=lora_r, lora_layers=lora_layers)
+        except Exception:
+            # Fallback to raw encoder if LoRA wrapping fails
+            pass
         # This is a placeholder value for ViT-7B hidden dimension.
         # You can get the correct value by inspecting `model.config.hidden_size` after loading the model.
         dinov3_hidden_dim = 4096
@@ -442,7 +457,7 @@ class SAM_MOE_3B(nn.Module):
         self.prompt_embed_dim = encoder_mode['prompt_embed_dim']
         self.mask_decoder = MaskDecoder(
             num_multimask_outputs=3,
-            transformer=TwoWayTransformer_moe(
+            transformer=TwoWayTransformer(
                 depth=2,
                 embedding_dim=self.prompt_embed_dim,
                 mlp_dim=2048,
@@ -545,6 +560,9 @@ class SAM_MOE_3B(nn.Module):
             multimask_output=False,
         )
 
+        # 选择第一个 mask token 的输出：(bs, 4, 33, h, w) -> (bs, 33, h, w)
+        low_res_masks = low_res_masks[:, 0]  # 取第一个 mask
+
         # Upscale the masks to the original image resolution
         masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
         self.pred_mask = masks
@@ -580,6 +598,9 @@ class SAM_MOE_3B(nn.Module):
             ),
             multimask_output=False,
         )
+
+        # 选择第一个 mask token 的输出：(bs, 4, 33, h, w) -> (bs, 33, h, w)
+        low_res_masks = low_res_masks[:, 0]  # 取第一个 mask
 
         # Upscale the masks to the original image resolution
         masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
