@@ -91,7 +91,7 @@ def main():
     # 加载模型
     device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
     model = models.make(config['model']).to(device)
-    checkpoint = torch.load(args.model, map_location=device)
+    checkpoint = torch.load(args.model, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint, strict=True)
     model.eval()
 

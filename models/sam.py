@@ -429,13 +429,20 @@ class SAM_MOE_3B(nn.Module):
         num_classes=None,
         loss_weight=None,
         ignore_index=-100,
+        resume=None,
     ):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # User needs to download the weights from https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/
         # and provide the local path here.
         weights_path = '/mnt/fanfq/data/fan/weights/dinov3_vit7b16_pretrain_sat493m-a6675841.pth'
-        self.image_encoder = torch.hub.load('dinov3-main', 'dinov3_vit7b16', source='local', weights=weights_path)
+        if resume is None:
+            # For new training, load official pretrained weights
+            self.image_encoder = torch.hub.load('dinov3-main', 'dinov3_vit7b16', source='local', weights=weights_path)
+        else:
+            # For resumed training, just initialize the model structure. Weights will be loaded from checkpoint.
+            self.image_encoder = torch.hub.load('dinov3-main', 'dinov3_vit7b16', source='local', pretrained=False)
+
         # Wrap DINOv3 encoder with LoRA for finetuning
         try:
             lora_r = encoder_mode.get('lora_r', 32) if isinstance(encoder_mode, dict) else 32

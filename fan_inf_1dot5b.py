@@ -31,13 +31,13 @@ def main():
                        default='/mnt/fanfq/project/code/cwsam_10b/configs/XinTong/XinTong_sam_vit_h_moe_3b.yaml', 
                        help='配置文件路径')
     parser.add_argument('--model', 
-                       default='/mnt/fanfq/project/code/cwsam_10b/save/cwsam_dinov3_b8_nomoe/model_epoch_12.pth',
+                       default='/mnt/fanfq/project/code/cwsam_10b/save/cwsam_dinov3_b8_nomoe_lora_r16-new/model_epoch_18.pth',
                        help='模型权重路径')
     parser.add_argument('--input_dir', 
                        default='/mnt/fanfq/data/fan/data/dataset/XinTong512_new/val/images',
                        help='输入图像文件夹')
     parser.add_argument('--output_dir', 
-                       default='/mnt/fanfq/project/code/cwsam_10b/inf_res/dinov3_e12',
+                       default='/mnt/fanfq/project/code/cwsam_10b/inf_res/dinov3_e18_545',
                        help='输出结果文件夹')
     parser.add_argument('--device', 
                        default='cuda:2',
@@ -97,7 +97,7 @@ def main():
     # 加载模型
     device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
     model = models.make(config['model']).to(device)
-    checkpoint = torch.load(args.model, map_location=device)
+    checkpoint = torch.load(args.model, map_location=device, weights_only=False)
     
     # 处理不同格式的checkpoint
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:

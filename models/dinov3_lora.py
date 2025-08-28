@@ -94,7 +94,7 @@ class DINOV3EncoderLoRA(nn.Module):
         Args:
             filename (str): File name of the weights
         """
-        state_dict = torch.load(filename)
+        state_dict = torch.load(filename, weights_only=False)
 
         for i, w_A_linear in enumerate(self.w_a):
             saved_key = f"w_a_{i:03d}"

@@ -102,7 +102,7 @@ def broadcast_object(obj, src=0):
     if dist.is_initialized():
         # 序列化对象
         buffer = io.BytesIO()
-        torch.save(obj, buffer)
+        torch.save(obj, buffer, pickle_protocol=4)
         data = bytearray(buffer.getbuffer())
         
         # 广播数据大小
@@ -123,7 +123,7 @@ def broadcast_object(obj, src=0):
         
         # 反序列化对象
         buffer = io.BytesIO(tensor.cpu().numpy().tobytes()[:int(local_size.item())])
-        obj = torch.load(buffer)
+        obj = torch.load(buffer, weights_only=False)
     return obj
 def make_optimizer(param_list, optimizer_spec, load_sd=False):
     Optimizer = {'sgd': SGD, 'adam': Adam, 'adamw': AdamW}[optimizer_spec['name']]

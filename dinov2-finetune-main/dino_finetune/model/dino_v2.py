@@ -153,7 +153,7 @@ class DINOV2EncoderLoRA(nn.Module):
         Args:
             filename (str): File name of the weights
         """
-        state_dict = torch.load(filename)
+        state_dict = torch.load(filename, weights_only=False)
 
         # Load the LoRA parameters
         if self.use_lora:

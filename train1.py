@@ -1,10 +1,11 @@
 import argparse
 import os
+import math
 
 import yaml
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 
 import datasets
 import models
@@ -75,6 +76,130 @@ def cleanup_memory():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def check_training_health(model, optimizer, epoch, loss_history):
+    """全面检查训练状态健康度"""
+    issues_found = []
+    
+    # 检查模型参数是否包含NaN/Inf
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if torch.isnan(param).any():
+                issues_found.append(f"参数 {name} 包含NaN")
+            if torch.isinf(param).any():
+                issues_found.append(f"参数 {name} 包含Inf")
+            
+            # 检查参数范围是否异常
+            param_max = param.abs().max().item()
+            if param_max > 100:
+                issues_found.append(f"参数 {name} 数值过大: {param_max:.2f}")
+    
+    # 检查学习率
+    current_lr = optimizer.param_groups[0]['lr']
+    if current_lr > 1e-2:
+        issues_found.append(f"学习率可能过高: {current_lr:.6f}")
+    elif current_lr < 1e-8:
+        issues_found.append(f"学习率可能过低: {current_lr:.6f}")
+    
+    # 检查损失历史
+    if len(loss_history) >= 3:
+        recent_losses = loss_history[-3:]
+        if all(l > 10.0 for l in recent_losses):
+            issues_found.append("连续3个epoch损失都很高")
+        elif any(math.isnan(l) or math.isinf(l) for l in recent_losses):
+            issues_found.append("最近损失包含异常值")
+    
+    if issues_found and local_rank == 0:
+        log(f"训练健康检查 Epoch {epoch} 发现问题:")
+        for issue in issues_found:
+            log(f"  - {issue}")
+    
+    return len(issues_found) == 0
+
+
+def check_and_adjust_learning_rate(optimizer, epoch, loss_history, patience=3):
+    """检查并调整学习率以防止训练不稳定"""
+    current_lr = optimizer.param_groups[0]['lr']
+    
+    # 如果学习率过高且最近损失不稳定，降低学习率
+    if len(loss_history) >= patience:
+        recent_losses = loss_history[-patience:]
+        if any(l > 10.0 for l in recent_losses):  # 损失过高
+            new_lr = current_lr * 0.5
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = new_lr
+            if local_rank == 0:
+                log(f"检测到高损失，将学习率从 {current_lr:.6f} 降低到 {new_lr:.6f}")
+            return True
+    
+    # 检查是否需要预热学习率（前几个epoch使用较小的学习率）
+    if epoch <= 3:
+        warmup_factor = 0.1
+        adjusted_lr = current_lr * warmup_factor
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = adjusted_lr
+        if local_rank == 0:
+            log(f"预热阶段，将学习率调整为 {adjusted_lr:.6f}")
+        return True
+    
+    return False
+
+
+def save_checkpoint_optimized(model, optimizer, save_path, epoch_or_name):
+    """优化的检查点保存函数，减少内存占用"""
+    try:
+        # 获取模型状态，但不立即创建完整的checkpoint字典
+        model_state = model.state_dict()
+        
+        # 逐步构建checkpoint，避免峰值内存占用
+        checkpoint_path = os.path.join(save_path, f"model_epoch_{epoch_or_name}.pth")
+        
+        # 直接保存，避免中间变量
+        torch.save({
+            'model': model_state,
+            'optimizer': optimizer.state_dict() if optimizer else None,
+        }, checkpoint_path)
+        
+        # 立即清理
+        del model_state
+        cleanup_memory()
+        
+        if local_rank == 0:
+            log(f"检查点已保存: {checkpoint_path}")
+            
+    except Exception as e:
+        if local_rank == 0:
+            log(f"保存检查点时出错: {e}")
+        cleanup_memory()
+
+
+def load_checkpoint_optimized(model, checkpoint_path, device_id):
+    """优化的检查点加载函数，减少内存占用"""
+    try:
+        if local_rank == 0:
+            log(f'加载checkpoint: {checkpoint_path}')
+            
+        # 直接加载到指定GPU，避免CPU内存占用
+        checkpoint = torch.load(checkpoint_path, map_location=f'cuda:{device_id}')
+        
+        # 提取模型状态并立即加载
+        if 'model' in checkpoint:
+            model.load_state_dict(checkpoint['model'], strict=False)
+            if local_rank == 0:
+                log('模型权重加载完成')
+        
+        # 立即删除checkpoint以释放内存
+        del checkpoint
+        cleanup_memory()
+        
+        return True
+        
+    except Exception as e:
+        if local_rank == 0:
+            log(f"加载检查点时出错: {e}")
+        cleanup_memory()
+        return False
 
 
 def color_to_list(
@@ -555,16 +680,61 @@ def eval_psnr(loader, model, config):
     return 0, 0, 0, 0, 'none', 'none', 'none', 'none', None, None
 
 
-def prepare_training():
+def prepare_training(save_path):
     print_memory_usage("模型创建前")
+
+    # 将resume状态传递给模型，以便决定是否加载预训练权重
+    if 'args' not in config['model']:
+        config['model']['args'] = {}
+    config['model']['args']['resume'] = config.get('resume')
+
+    epoch_start = 1
     
-    model = models.make(config['model'])
-    print_memory_usage("模型创建后，DDP转换前")
+    # 如果是恢复训练，使用优化的加载策略
+    if config.get('resume') is not None:
+        epoch_start = config.get('resume') + 1
+        work_dir = config.get('work_dir', save_path)
+        resume_model_path = os.path.join(
+            work_dir, 'model_epoch_' + str(config.get('resume')) + '.pth'
+        )
+        
+        if local_rank == 0:
+            log(f'优化方式加载checkpoint: {resume_model_path}')
+            
+        # 优化策略1: 直接在GPU上创建模型，避免CPU->GPU的内存拷贝
+        torch.cuda.set_device(local_rank)
+        model = models.make(config['model']).cuda()
+        print_memory_usage("模型直接在GPU上创建后")
+        
+        # 优化策略2: 分布式加载，每个进程直接加载到自己的GPU上
+        if local_rank == 0:
+            log('每个进程独立加载checkpoint到GPU，避免广播大对象')
+            
+        # 使用优化的加载函数
+        success = load_checkpoint_optimized(model, resume_model_path, local_rank)
+        if not success:
+            if local_rank == 0:
+                log("警告: 使用优化加载失败，回退到原始方法")
+            # 回退方案：原始加载方法
+            checkpoint = torch.load(resume_model_path, map_location=f'cuda:{local_rank}')
+            model.load_state_dict(checkpoint['model'], strict=False)
+            del checkpoint
+            cleanup_memory()
+        
+        print_memory_usage("checkpoint加载完成后内存清理")
+        
+        if local_rank == 0:
+            log('从 epoch {} 恢复训练 (优化内存使用)'.format(epoch_start))
+    else:
+        # 不恢复训练的情况，直接在GPU上创建模型
+        model = models.make(config['model']).cuda()
+        print_memory_usage("新模型直接在GPU上创建后")
     
-    # 先将模型转换为 DDP
-    model = model.cuda().to(memory_format=torch.channels_last)
-    print_memory_usage("模型移至GPU后")
-    
+    # 将模型设置为channels_last内存格式以提高性能
+    model = model.to(memory_format=torch.channels_last)
+    print_memory_usage("模型转换为channels_last后")
+
+    # DDP包装
     model = torch.nn.parallel.DistributedDataParallel(
         model,
         device_ids=[local_rank],
@@ -573,57 +743,14 @@ def prepare_training():
         broadcast_buffers=False,
     )
     print_memory_usage("DDP模型创建后")
-    
-    optimizer = utils.make_optimizer(model.parameters(), config['optimizer'])
-    
-    # 加载 checkpoint
-    if config.get('resume') is not None:
-        epoch_start = config.get('resume') + 1
-        resume_model_path = os.path.join(
-            config.get('work_dir'), 'model_epoch_' + str(config.get('resume')) + '.pth'
-        )
-        
-        # 只在 rank 0 加载权重
-        if local_rank == 0:
-            log(f'Loading checkpoint from {resume_model_path}')
-            checkpoint = torch.load(resume_model_path, map_location=device)
-        else:
-            # 其他rank也需要一个结构来接收广播的数据
-            checkpoint = None
-
-        # 使用 broadcast_object 来同步整个 checkpoint 字典
-        checkpoint = utils.broadcast_object(checkpoint, src=0)
-
-        # 加载模型和优化器状态
-        model.module.load_state_dict(checkpoint['model'], strict=False)
-        optimizer.load_state_dict(checkpoint['optimizer'])
-
-        if local_rank == 0:
-            log('Resume training from epoch {}'.format(epoch_start))
-
-    else:
-        epoch_start = 1
-
-    max_epoch = config.get('epoch_max')
-    lr_scheduler = CosineAnnealingLR(optimizer, max_epoch, eta_min=config.get('lr_min'))
-
-    # 如果是恢复训练，需要将lr_scheduler也设置到正确的epoch
-    if config.get('resume') is not None:
-        # CosineAnnealingLR的step需要在epoch循环中调用，但我们需要让它“快进”到正确的状态
-        # PyTorch 1.12+的lr_scheduler有last_epoch属性，可以直接设置
-        # 为了简单和兼容，我们可以在加载后手动迭代
-        for _ in range(config.get('resume')):
-             lr_scheduler.step()
-        if local_rank == 0:
-            log(f"LR scheduler advanced to epoch {config.get('resume')}. Next LR will be {lr_scheduler.get_last_lr()[0]}")
 
     if local_rank == 0:
         log('model: #params={}'.format(utils.compute_num_params(model, text=True)))
     
-    return model.module, optimizer, epoch_start, lr_scheduler
+    return model.module, epoch_start
 
 
-def train(train_loader, model):
+def train(train_loader, model, scheduler):
     model.train()
 
     if local_rank == 0:
@@ -632,7 +759,10 @@ def train(train_loader, model):
         pbar = None
 
     loss_list = []
-    for batch in train_loader:
+    nan_count = 0
+    max_grad_norm = 1.0  # 梯度裁剪阈值
+    
+    for batch_idx, batch in enumerate(train_loader):
         for k, v in batch.items():
             # channels_last + 非阻塞拷贝
             if isinstance(v, torch.Tensor):
@@ -650,20 +780,87 @@ def train(train_loader, model):
         else:
             # 单任务模式，向后兼容
             model.set_input(inp, gt)
-            
-        # BF16 autocast 加速
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            model.optimize_parameters()
+        
+        # 使用更稳定的混合精度训练
+        # 改用fp16而不是bfloat16以提高数值稳定性
+        try:
+            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
+                # 手动执行优化步骤以增加控制
+                model.forward()
+                model.optimizer.zero_grad()
+                
+                # 检查前向传播结果
+                if torch.isnan(model.pred_mask).any() or torch.isinf(model.pred_mask).any():
+                    if local_rank == 0:
+                        log(f"警告: batch {batch_idx} 前向传播产生了NaN/Inf，跳过此batch")
+                    continue
+                
+                # 计算损失
+                model.backward_G()
+                
+                # 检查损失是否为NaN
+                if torch.isnan(model.loss_G) or torch.isinf(model.loss_G):
+                    nan_count += 1
+                    if local_rank == 0:
+                        log(f"警告: batch {batch_idx} 损失为NaN/Inf: {model.loss_G.item()}")
+                    # 跳过这个batch，不更新参数
+                    model.optimizer.zero_grad()
+                    continue
+                
+                # 梯度裁剪防止梯度爆炸
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                
+                # 检查梯度
+                total_grad_norm = 0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_grad_norm += param_norm.item() ** 2
+                        # 检查单个参数的梯度是否异常
+                        if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                            if local_rank == 0:
+                                log(f"警告: batch {batch_idx} 检测到异常梯度，重置为零")
+                            p.grad.data.zero_()
+                
+                total_grad_norm = total_grad_norm ** (1. / 2)
+                
+                # 如果梯度范数异常大，额外警告
+                if total_grad_norm > 10.0:
+                    if local_rank == 0:
+                        log(f"警告: batch {batch_idx} 梯度范数较大: {total_grad_norm:.4f}")
+                
+                # 更新参数
+                model.optimizer.step()
+                scheduler.step()
+                
+        except Exception as e:
+            if local_rank == 0:
+                log(f"训练异常 batch {batch_idx}: {e}")
+            continue
+        
+        # 收集损失
         batch_loss = [
             torch.zeros_like(model.loss_G) for _ in range(dist.get_world_size())
         ]
         dist.all_gather(batch_loss, model.loss_G)
         loss_list.extend(batch_loss)
+        
         if pbar is not None:
+            # 显示当前损失和累计NaN数量
+            current_loss = model.loss_G.item()
+            pbar.set_postfix({
+                'loss': f'{current_loss:.4f}', 
+                'nan_count': nan_count,
+                'grad_norm': f'{total_grad_norm:.2f}' if 'total_grad_norm' in locals() else 'N/A'
+            })
             pbar.update(1)
 
     if pbar is not None:
         pbar.close()
+
+    # 统计信息
+    if local_rank == 0 and nan_count > 0:
+        log(f"训练完成，总共跳过 {nan_count} 个NaN/Inf batch")
 
     loss = [i.item() for i in loss_list]
     return mean(loss)
@@ -705,27 +902,15 @@ def main(config_, save_path, args):
             'gt': {'sub': [0], 'div': [1]},
         }
 
-    model, optimizer, epoch_start, lr_scheduler = prepare_training()
-    model.optimizer = optimizer
-    lr_scheduler = CosineAnnealingLR(
-        model.optimizer, config['epoch_max'], eta_min=config.get('lr_min')
-    )
+    # 1. 准备模型和训练起点（使用优化的内存管理）
+    model, epoch_start = prepare_training(save_path)
+    print_memory_usage("模型准备完成后")
 
-    model = model.cuda().to(memory_format=torch.channels_last)
-    model = torch.nn.parallel.DistributedDataParallel(
-        model,
-        device_ids=[args.local_rank],
-        output_device=args.local_rank,
-        find_unused_parameters=True,
-        broadcast_buffers=False,
-    )
-    model = model.module
-
-    # 精确控制可训练参数：默认全部冻结，仅训练 LoRA + 投影 + 解码头
+    # 2. 精确控制可训练参数
     for param in model.parameters():
         param.requires_grad = False
 
-    # 启用 LoRA 参数（LoRA 模块 + w_a/w_b 列表）
+    # 启用 LoRA 参数
     try:
         from models.lora import LoRA as LoRAModule
     except Exception:
@@ -734,7 +919,6 @@ def main(config_, save_path, args):
     if LoRAModule is not None:
         for module in model.modules():
             if isinstance(module, LoRAModule):
-                # 仅训练 LoRA 低秩矩阵，显式关闭原始 qkv 参数
                 for name, p in module.named_parameters():
                     if name.startswith('qkv.'):
                         p.requires_grad = False
@@ -742,7 +926,6 @@ def main(config_, save_path, args):
                         p.requires_grad = True
 
     if hasattr(model, 'image_encoder'):
-        # DINOV3EncoderLoRA 中的 w_a/w_b 列表
         if hasattr(model.image_encoder, 'w_a'):
             for lin in model.image_encoder.w_a:
                 for p in lin.parameters():
@@ -752,7 +935,7 @@ def main(config_, save_path, args):
                 for p in lin.parameters():
                     p.requires_grad = True
 
-    # 启用 projection 和 解码头（单任务 mask_decoder / 多任务 mask_decoders）以及位置/无掩码嵌入
+    # 启用 projection 和 解码头
     for name, p in model.named_parameters():
         if (
             name.startswith('projection')
@@ -764,9 +947,35 @@ def main(config_, save_path, args):
             p.requires_grad = True
 
     cleanup_memory()
+    print_memory_usage("参数设置完成后")
+
+    # 3. 在参数冻结后，只为可训练的参数创建优化器
+    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+    optimizer = utils.make_optimizer(trainable_params, config['optimizer'])
+    model.optimizer = optimizer
+    print_memory_usage("优化器创建后")
+    
+    # 4. 创建学习率调度器 (使用 OneCycleLR 进行快速收敛)
+    lr_scheduler = OneCycleLR(
+        optimizer,
+        max_lr=config['optimizer']['args']['lr'],
+        epochs=config['epoch_max'],
+        steps_per_epoch=len(train_loader)
+    )
+
+    # 如果恢复训练，更新调度器状态
+    if config.get('resume') is not None:
+        # 对于按批次更新的 OneCycleLR，需要将调度器推进到正确的步数
+        steps_to_advance = (epoch_start - 1) * len(train_loader)
+        for _ in range(steps_to_advance):
+            lr_scheduler.step()
+        if local_rank == 0:
+            log(f"学习率调度器已更新至 epoch {epoch_start - 1}. 下一个LR为 {lr_scheduler.get_last_lr()[0]}")
+
+    print_memory_usage("最终模型设置完成")
 
     if local_rank == 0:
-        log("\n--- Trainable Parameters ---")
+        log("\n--- 可训练参数 ---")
         for name, para in model.named_parameters():
             if para.requires_grad:
                 log(name)
@@ -790,11 +999,35 @@ def main(config_, save_path, args):
     epoch_save = config.get('epoch_save')
     max_val_v = -1e18 if config['eval_type'] != 'ber' else 1e8
     timer = utils.Timer()
+    
+    # 添加损失历史记录用于训练稳定性监控
+    loss_history = []
+    
     for epoch in range(epoch_start, epoch_max + 1):
         train_loader.sampler.set_epoch(epoch)
         t_epoch_start = timer.t()
-        train_loss_G = train(train_loader, model)
-        lr_scheduler.step()
+        
+        # 在训练前检查学习率 (OneCycleLR 自动处理预热和调度)
+        # check_and_adjust_learning_rate(optimizer, epoch, loss_history)
+        
+        # 训练前进行健康检查
+        is_healthy = check_training_health(model, optimizer, epoch, loss_history)
+        if not is_healthy and local_rank == 0:
+            log(f"警告: Epoch {epoch} 训练前发现健康问题，将谨慎进行训练")
+        
+        train_loss_G = train(train_loader, model, lr_scheduler)
+        
+        # 检查训练损失是否异常
+        if math.isnan(train_loss_G) or math.isinf(train_loss_G):
+            if local_rank == 0:
+                log(f"错误: Epoch {epoch} 训练损失为 {train_loss_G}，训练不稳定！")
+                # 注意: OneCycleLR 会自动管理学习率，通常不需要手动干预
+        else:
+            # 记录损失历史
+            loss_history.append(train_loss_G)
+            # 保持历史记录在合理长度
+            if len(loss_history) > 20:
+                loss_history.pop(0)
         
         # 清理GPU内存
         cleanup_memory()
@@ -806,30 +1039,26 @@ def main(config_, save_path, args):
                 )
             ]
             writer.add_scalar('lr', optimizer.param_groups[0]['lr'], epoch)
-            log_info.append('train G: loss={:.4f}'.format(train_loss_G))
+            
+            # 改进损失显示
+            if math.isnan(train_loss_G) or math.isinf(train_loss_G):
+                log_info.append('train G: loss={} (异常值!)'.format(train_loss_G))
+            else:
+                log_info.append('train G: loss={:.4f}'.format(train_loss_G))
+                
             writer.add_scalars('loss', {'train G': train_loss_G}, epoch)
 
-            model_spec = config['model']
-            # model_spec['sd'] = model.state_dict()
-            optimizer_spec = config['optimizer']
-            # optimizer_spec['sd'] = optimizer.state_dict()
-            
-            # 将模型和优化器状态打包保存在一个字典里
-            checkpoint = {
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-            }
-            torch.save(checkpoint, os.path.join(save_path, f"model_epoch_{epoch}.pth"))
+            # 只有在损失正常时才保存检查点
+            if not (math.isnan(train_loss_G) or math.isinf(train_loss_G)):
+                save_checkpoint_optimized(model, optimizer, save_path, epoch)
+            else:
+                log("跳过异常epoch的检查点保存")
 
 
         if (epoch_val is not None) and (epoch % epoch_val == 0):
-            # 验证之前也保存一次，以防验证过程出错
-            if local_rank == 0:
-                checkpoint = {
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                }
-                torch.save(checkpoint, os.path.join(save_path, f"model_epoch_{epoch}.pth"))
+            # 验证之前清理内存
+            cleanup_memory()
+            print_memory_usage("验证前内存状态")
 
             with torch.no_grad():
                 (
@@ -852,21 +1081,13 @@ def main(config_, save_path, args):
                 if config['eval_type'] != 'ber':
                     if result1 > max_val_v:
                         max_val_v = result1
-                        # save(config, model, save_path, 'best')
-                        checkpoint = {
-                           'model': model.state_dict(),
-                           'optimizer': optimizer.state_dict(),
-                        }
-                        torch.save(checkpoint, os.path.join(save_path, "model_epoch_best.pth"))
+                        # 使用优化的检查点保存函数保存最佳模型
+                        save_checkpoint_optimized(model, optimizer, save_path, "best")
                 else:
                     if result3 < max_val_v:
                         max_val_v = result3
-                        # save(config, model, save_path, 'best')
-                        checkpoint = {
-                           'model': model.state_dict(),
-                           'optimizer': optimizer.state_dict(),
-                        }
-                        torch.save(checkpoint, os.path.join(save_path, "model_epoch_best.pth"))
+                        # 使用优化的检查点保存函数保存最佳模型
+                        save_checkpoint_optimized(model, optimizer, save_path, "best")
 
                 t = timer.t()
                 prog = (epoch - epoch_start + 1) / (epoch_max - epoch_start + 1)
@@ -914,12 +1135,19 @@ if __name__ == '__main__':
     parser.add_argument('--name', default=None)
     parser.add_argument('--tag', default=None)
     parser.add_argument("--local_rank", type=int, default=-1, help="")
+    parser.add_argument('--resume', type=int, default=None, help='Resume training from specific epoch')
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
         if local_rank == 0:
             print('config loaded.')
+
+    # 设置resume参数（如果通过命令行指定）
+    if args.resume is not None:
+        config['resume'] = args.resume
+        if local_rank == 0:
+            print(f'Will resume training from epoch {args.resume}')
 
     save_name = args.name
     if save_name is None:

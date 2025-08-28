@@ -340,7 +340,7 @@ if __name__ == '__main__':
     )
 
     model = models.make(config['model']).cuda()
-    sam_checkpoint = torch.load(args.model, map_location='cuda')
+    sam_checkpoint = torch.load(args.model, map_location='cuda', weights_only=False)
     model.load_state_dict(sam_checkpoint, strict=True)
 
     with torch.no_grad():

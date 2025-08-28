@@ -627,7 +627,7 @@ def prepare_training():
         checkpoint = None
         
         if local_rank == 0:
-            checkpoint = torch.load(resume_model_path, map_location='cpu')
+            checkpoint = torch.load(resume_model_path, map_location='cpu', weights_only=False)
             log(f'Loading checkpoint from {resume_model_path}')
             
             # 检查checkpoint格式
@@ -819,7 +819,7 @@ def main(config_, save_path, args):
     )
     model = model.module
 
-    sam_checkpoint = torch.load(config['sam_checkpoint'])
+    sam_checkpoint = torch.load(config['sam_checkpoint'], weights_only=False)
 
     def load_filtered_state_dict(model, state_dict):
         model_dict = model.state_dict()
