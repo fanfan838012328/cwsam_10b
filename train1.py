@@ -690,7 +690,7 @@ def prepare_training(save_path):
 
     epoch_start = 1
     
-    # 如果是恢复训练，使用优化的加载策略
+    # 场景1: 从之前的训练中完全恢复 (加载权重并快进学习率)
     if config.get('resume') is not None:
         epoch_start = config.get('resume') + 1
         work_dir = config.get('work_dir', save_path)
@@ -699,32 +699,48 @@ def prepare_training(save_path):
         )
         
         if local_rank == 0:
-            log(f'优化方式加载checkpoint: {resume_model_path}')
+            log(f'恢复训练，加载 checkpoint: {resume_model_path}')
             
-        # 优化策略1: 直接在GPU上创建模型，避免CPU->GPU的内存拷贝
-        torch.cuda.set_device(local_rank)
         model = models.make(config['model']).cuda()
         print_memory_usage("模型直接在GPU上创建后")
         
-        # 优化策略2: 分布式加载，每个进程直接加载到自己的GPU上
-        if local_rank == 0:
-            log('每个进程独立加载checkpoint到GPU，避免广播大对象')
-            
-        # 使用优化的加载函数
         success = load_checkpoint_optimized(model, resume_model_path, local_rank)
         if not success:
             if local_rank == 0:
                 log("警告: 使用优化加载失败，回退到原始方法")
-            # 回退方案：原始加载方法
             checkpoint = torch.load(resume_model_path, map_location=f'cuda:{local_rank}')
             model.load_state_dict(checkpoint['model'], strict=False)
             del checkpoint
             cleanup_memory()
         
         print_memory_usage("checkpoint加载完成后内存清理")
-        
         if local_rank == 0:
-            log('从 epoch {} 恢复训练 (优化内存使用)'.format(epoch_start))
+            log('从 epoch {} 恢复训练'.format(epoch_start))
+            
+    # 场景2: 开始新训练，但从指定checkpoint加载权重 (学习率从头开始)
+    elif config.get('sam_checkpoint') is not None:
+        model = models.make(config['model']).cuda()
+        print_memory_usage("新模型直接在GPU上创建后")
+        
+        checkpoint_path = config.get('sam_checkpoint')
+        if local_rank == 0:
+            log(f'加载指定权重进行新训练: {checkpoint_path}')
+        
+        success = load_checkpoint_optimized(model, checkpoint_path, local_rank)
+        if not success:
+            if local_rank == 0:
+                log("警告: 使用优化加载失败，回退到原始方法")
+            checkpoint = torch.load(checkpoint_path, map_location=f'cuda:{local_rank}')
+            model.load_state_dict(checkpoint['model'], strict=False)
+            del checkpoint
+            cleanup_memory()
+            
+        print_memory_usage("从 sam_checkpoint 加载权重后")
+        if local_rank == 0:
+            log('权重加载完成，将从 epoch 1 开始新的训练')
+        # epoch_start 保持为 1, 学习率调度器将从头开始
+
+    # 场景3: 完全从头开始训练
     else:
         # 不恢复训练的情况，直接在GPU上创建模型
         model = models.make(config['model']).cuda()

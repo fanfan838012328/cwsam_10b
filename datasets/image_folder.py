@@ -37,10 +37,10 @@ class ImageFolder(Dataset):
             ])
         else:
             self.img_transform = transforms.Compose([
-                transforms.Resize((self.size, self.size)),
+                transforms.Resize((self.size, self.size), antialias=True),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+                transforms.Normalize(mean=[0.430, 0.411, 0.296],
+                                     std=[0.213, 0.156, 0.143])
             ])
 
         if split_file is None:
