@@ -19,6 +19,7 @@ from .mmseg.models.sam import (
     ImageEncoderViT_moe_layer,
 
 )
+from .mmseg.models.sam.common import LayerNorm2d
 from .dinov3_lora import DINOV3EncoderLoRA
 
 logger = logging.getLogger(__name__)
@@ -400,7 +401,7 @@ class SAM_MOE_3B_MultiTask(nn.Module):
                 total_loss += task_loss
         
         self.loss_G = total_loss
-        self.loss_G.backward()
+        # self.loss_G.backward() # 反向传播由训练循环中的 GradScaler 控制
 
     def optimize_parameters(self):
         """优化参数"""
@@ -457,9 +458,10 @@ class SAM_MOE_3B(nn.Module):
         # Use a safe power-of-2 intermediate dimension to avoid potential numerical issues
         mid_dim = 1024  # Safe intermediate dimension
         self.projection = nn.Sequential(
-            nn.Conv2d(dinov3_hidden_dim, mid_dim, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(mid_dim, encoder_mode['prompt_embed_dim'], kernel_size=1)
+            nn.Conv2d(dinov3_hidden_dim, mid_dim, kernel_size=1, bias=False),
+            LayerNorm2d(mid_dim),
+            nn.Conv2d(mid_dim, encoder_mode['prompt_embed_dim'], kernel_size=3, padding=1, bias=False),
+            LayerNorm2d(encoder_mode['prompt_embed_dim']),
         )
         self.prompt_embed_dim = encoder_mode['prompt_embed_dim']
         self.mask_decoder = MaskDecoder(
@@ -686,7 +688,7 @@ class SAM_MOE_3B(nn.Module):
         # if self.loss_mode == 'iou':
         # self.loss_G += _iou_loss(self.pred_mask, self.gt_mask)
 
-        self.loss_G.backward()
+        # self.loss_G.backward() # 反向传播由训练循环中的 GradScaler 控制
 
     def optimize_parameters(self):
         self.forward()

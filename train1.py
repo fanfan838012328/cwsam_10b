@@ -736,7 +736,26 @@ def prepare_training(save_path):
             cleanup_memory()
             
         print_memory_usage("从 sam_checkpoint 加载权重后")
+        
+        # 检查加载的权重是否包含异常值
         if local_rank == 0:
+            log('检查加载的模型权重健康状态...')
+            nan_params = 0
+            inf_params = 0
+            large_params = 0
+            for name, param in model.named_parameters():
+                if torch.isnan(param).any():
+                    nan_params += 1
+                    log(f"警告: 参数 {name} 包含NaN值")
+                if torch.isinf(param).any():
+                    inf_params += 1
+                    log(f"警告: 参数 {name} 包含Inf值")
+                param_max = param.abs().max().item()
+                if param_max > 100:
+                    large_params += 1
+                    log(f"警告: 参数 {name} 数值过大: {param_max:.2f}")
+            
+            log(f'权重健康检查完成: NaN参数={nan_params}, Inf参数={inf_params}, 过大参数={large_params}')
             log('权重加载完成，将从 epoch 1 开始新的训练')
         # epoch_start 保持为 1, 学习率调度器将从头开始
 
@@ -766,7 +785,7 @@ def prepare_training(save_path):
     return model.module, epoch_start
 
 
-def train(train_loader, model, scheduler):
+def train(train_loader, model, scheduler, scaler):
     model.train()
 
     if local_rank == 0:
@@ -776,7 +795,11 @@ def train(train_loader, model, scheduler):
 
     loss_list = []
     nan_count = 0
-    max_grad_norm = 1.0  # 梯度裁剪阈值
+    # 根据是否从检查点开始训练，使用不同的梯度裁剪策略
+    if config.get('sam_checkpoint') is not None:
+        max_grad_norm = 0.01  # 检查点训练使用更严格的梯度裁剪
+    else:
+        max_grad_norm = 0.1   # 从头训练使用标准梯度裁剪
     
     for batch_idx, batch in enumerate(train_loader):
         for k, v in batch.items():
@@ -797,61 +820,63 @@ def train(train_loader, model, scheduler):
             # 单任务模式，向后兼容
             model.set_input(inp, gt)
         
-        # 使用更稳定的混合精度训练
         # 改用fp16而不是bfloat16以提高数值稳定性
         try:
             with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
                 # 手动执行优化步骤以增加控制
                 model.forward()
-                model.optimizer.zero_grad()
+                model.optimizer.zero_grad(set_to_none=True) # 使用 set_to_none=True 进一步优化内存
                 
                 # 检查前向传播结果
                 if torch.isnan(model.pred_mask).any() or torch.isinf(model.pred_mask).any():
                     if local_rank == 0:
                         log(f"警告: batch {batch_idx} 前向传播产生了NaN/Inf，跳过此batch")
+                    cleanup_memory() # 出现异常时清理内存
                     continue
                 
                 # 计算损失
                 model.backward_G()
                 
-                # 检查损失是否为NaN
-                if torch.isnan(model.loss_G) or torch.isinf(model.loss_G):
-                    nan_count += 1
-                    if local_rank == 0:
-                        log(f"警告: batch {batch_idx} 损失为NaN/Inf: {model.loss_G.item()}")
-                    # 跳过这个batch，不更新参数
-                    model.optimizer.zero_grad()
-                    continue
-                
-                # 梯度裁剪防止梯度爆炸
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                
-                # 检查梯度
-                total_grad_norm = 0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.data.norm(2)
-                        total_grad_norm += param_norm.item() ** 2
-                        # 检查单个参数的梯度是否异常
-                        if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
-                            if local_rank == 0:
-                                log(f"警告: batch {batch_idx} 检测到异常梯度，重置为零")
-                            p.grad.data.zero_()
-                
-                total_grad_norm = total_grad_norm ** (1. / 2)
-                
-                # 如果梯度范数异常大，额外警告
-                if total_grad_norm > 10.0:
-                    if local_rank == 0:
-                        log(f"警告: batch {batch_idx} 梯度范数较大: {total_grad_norm:.4f}")
-                
-                # 更新参数
-                model.optimizer.step()
-                scheduler.step()
+            # 在 GradScaler 外部计算损失，因为它内部会进行类型转换
+            # 但反向传播需要通过 scaler 完成
+            if torch.isnan(model.loss_G) or torch.isinf(model.loss_G):
+                nan_count += 1
+                if local_rank == 0:
+                    log(f"警告: batch {batch_idx} 损失为NaN/Inf: {model.loss_G.item()}")
+                # 跳过这个batch，不更新参数
+                cleanup_memory() # 出现异常时清理内存
+                continue
+            
+            # 使用 GradScaler 缩放损失并反向传播
+            scaler.scale(model.loss_G).backward()
+            
+            # 在梯度裁剪前取消缩放
+            scaler.unscale_(model.optimizer)
+            
+            # 梯度裁剪防止梯度爆炸，并获取梯度范数
+            total_grad_norm_tensor = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            total_grad_norm = total_grad_norm_tensor.item()
+
+            # 如果梯度范数异常大，额外警告 (动态调整阈值)
+            warning_threshold = max(max_grad_norm * 20, 5.0)  # 更合理的警告阈值
+            if torch.isinf(total_grad_norm_tensor) or torch.isnan(total_grad_norm_tensor) or total_grad_norm > warning_threshold:
+                if local_rank == 0:
+                    log(
+                        f"警告: batch {batch_idx} 梯度范数较大或异常: {total_grad_norm:.4f}, 当前缩放因子: {scaler.get_scale()}"
+                    )
+
+            # scaler.step() 会自动检查梯度是否为NaN/Inf，并决定是否更新
+            scaler.step(model.optimizer)
+            
+            # 更新缩放器，为下一次迭代做准备
+            scaler.update()
+            
+            scheduler.step()
                 
         except Exception as e:
             if local_rank == 0:
                 log(f"训练异常 batch {batch_idx}: {e}")
+            cleanup_memory() # 出现异常时清理内存
             continue
         
         # 收集损失
@@ -864,11 +889,16 @@ def train(train_loader, model, scheduler):
         if pbar is not None:
             # 显示当前损失和累计NaN数量
             current_loss = model.loss_G.item()
-            pbar.set_postfix({
-                'loss': f'{current_loss:.4f}', 
-                'nan_count': nan_count,
-                'grad_norm': f'{total_grad_norm:.2f}' if 'total_grad_norm' in locals() else 'N/A'
-            })
+            pbar.set_postfix(
+                {
+                    'loss': f'{current_loss:.4f}',
+                    'nan_count': nan_count,
+                    'grad_norm': f'{total_grad_norm:.2f}'
+                    if 'total_grad_norm' in locals()
+                    else 'N/A',
+                    'scale': scaler.get_scale(),
+                }
+            )
             pbar.update(1)
 
     if pbar is not None:
@@ -971,13 +1001,29 @@ def main(config_, save_path, args):
     model.optimizer = optimizer
     print_memory_usage("优化器创建后")
     
-    # 4. 创建学习率调度器 (使用 OneCycleLR 进行快速收敛)
-    lr_scheduler = OneCycleLR(
-        optimizer,
-        max_lr=config['optimizer']['args']['lr'],
-        epochs=config['epoch_max'],
-        steps_per_epoch=len(train_loader)
-    )
+    # 4. 创建学习率调度器
+    # 对于从检查点加载的训练，使用更温和的调度器
+    if config.get('sam_checkpoint') is not None:
+        # 从检查点开始训练：使用非常小的学习率和温和的余弦退火
+        adjusted_lr = config['optimizer']['args']['lr'] * 0.05  # 降低到1/20 (平衡稳定性和收敛速度)
+        lr_scheduler = CosineAnnealingLR(
+            optimizer, 
+            T_max=config['epoch_max'] * len(train_loader),
+            eta_min=1e-7  # 调整最小学习率以匹配新的学习率范围
+        )
+        # 手动设置较低的初始学习率
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = adjusted_lr
+        if local_rank == 0:
+            log(f"从检查点开始训练，学习率调整为: {adjusted_lr:.2e} (平衡稳定性与收敛速度)")
+    else:
+        # 从头开始训练：使用原来的 OneCycleLR
+        lr_scheduler = OneCycleLR(
+            optimizer,
+            max_lr=config['optimizer']['args']['lr'],
+            epochs=config['epoch_max'],
+            steps_per_epoch=len(train_loader)
+        )
 
     # 如果恢复训练，更新调度器状态
     if config.get('resume') is not None:
@@ -1016,6 +1062,9 @@ def main(config_, save_path, args):
     max_val_v = -1e18 if config['eval_type'] != 'ber' else 1e8
     timer = utils.Timer()
     
+    # 为混合精度训练初始化 GradScaler (修正了FutureWarning)
+    scaler = torch.amp.GradScaler('cuda', enabled=True)
+    
     # 添加损失历史记录用于训练稳定性监控
     loss_history = []
     
@@ -1031,7 +1080,7 @@ def main(config_, save_path, args):
         if not is_healthy and local_rank == 0:
             log(f"警告: Epoch {epoch} 训练前发现健康问题，将谨慎进行训练")
         
-        train_loss_G = train(train_loader, model, lr_scheduler)
+        train_loss_G = train(train_loader, model, lr_scheduler, scaler)
         
         # 检查训练损失是否异常
         if math.isnan(train_loss_G) or math.isinf(train_loss_G):
@@ -1119,6 +1168,14 @@ def main(config_, save_path, args):
 
                 log('\n'.join(log_info))
                 writer.flush()
+                
+                # 关键：显式删除只在 rank 0 上创建的大型变量，帮助垃圾回收
+                del (
+                    result1, result2, result3, result4,
+                    metric1, metric2, metric3, metric4,
+                    seg_eval_table, normed_confusionMatrix
+                )
+                cleanup_memory() # 再次调用内存清理
 
 
 def save(config, model, save_path, name):
