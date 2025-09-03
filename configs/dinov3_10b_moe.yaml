@@ -1,0 +1,139 @@
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      classes: [
+            '背景', '旱地', '园地', '水田', '灌木林', 
+            '乔木林', '疏林', '其它林地', '草地', '密集建筑区',
+            '独立建筑', '农业大棚', '机场', '尾矿库', '露天采矿场',
+            '露天采石场', '建筑工地', '墓地', '不透水面', '道路',
+            '铁路', '桥梁', '广场', '体育场', '水域',
+            '大坝（可发电）', '大坝（不可发电）', '沙漠', '裸地', '冰川', '云', '停车场', '光伏板'
+        ]
+      ignore_bg: false
+      palette:  [
+          [0, 0, 0], [1, 1, 1], [2, 2, 2], [3, 3, 3], [4, 4, 4], [5, 5, 5], [6, 6, 6], [7, 7, 7],[8, 8, 8], [9, 9, 9], [10, 10, 10], [11, 11, 11], [12, 12, 12], [13, 13, 13], [14, 14, 14], [15, 15, 15], [16, 16, 16], [17, 17, 17], [18, 18, 18], [19, 19, 19],
+                      [20, 20, 20], [21, 21, 21], [22, 22, 22], [23, 23, 23], [24, 24, 24], [25, 25, 25], [26, 26, 26], [27, 27, 27], [28, 28, 28], [29, 29, 29], [30, 30, 30], [31, 31, 31], [32, 32, 32]
+        ]
+      root_path_1: /mnt/fanfq/data/fan/data/dataset/XinTong512_new/train/images
+      root_path_2: /mnt/fanfq/data/fan/data/dataset/XinTong512_new/train/labels
+      cache: none
+      split_key: train
+  wrapper:
+    name: train
+    args:
+      inp_size: 512
+      augment: false
+  batch_size: 1  # 减小batch size以适应10B模型
+
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      classes: [
+            '背景', '旱地', '园地', '水田', '灌木林', 
+            '乔木林', '疏林', '其它林地', '草地', '密集建筑区',
+            '独立建筑', '农业大棚', '机场', '尾矿库', '露天采矿场',
+            '露天采石场', '建筑工地', '墓地', '不透水面', '道路',
+            '铁路', '桥梁', '广场', '体育场', '水域',
+            '大坝（可发电）', '大坝（不可发电）', '沙漠', '裸地', '冰川', '云', '停车场', '光伏板'
+        ]
+      ignore_bg: false
+      palette:  [
+          [0, 0, 0], [1, 1, 1], [2, 2, 2], [3, 3, 3], [4, 4, 4], [5, 5, 5], [6, 6, 6], [7, 7, 7],[8, 8, 8], [9, 9, 9], [10, 10, 10], [11, 11, 11], [12, 12, 12], [13, 13, 13], [14, 14, 14], [15, 15, 15], [16, 16, 16], [17, 17, 17], [18, 18, 18], [19, 19, 19],
+                      [20, 20, 20], [21, 21, 21], [22, 22, 22], [23, 23, 23], [24, 24, 24], [25, 25, 25], [26, 26, 26], [27, 27, 27], [28, 28, 28], [29, 29, 29], [30, 30, 30], [31, 31, 31], [32, 32, 32]
+        ]
+      root_path_1: /mnt/fanfq/data/fan/data/dataset/XinTong512_new/val/images
+      root_path_2: /mnt/fanfq/data/fan/data/dataset/XinTong512_new/val/labels
+      cache: none
+      split_key: test
+  wrapper:
+    name: val
+    args:
+      inp_size: 512
+  batch_size: 1
+
+test_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      classes: [
+            '背景', '旱地', '园地', '水田', '灌木林', 
+            '乔木林', '疏林', '其它林地', '草地', '密集建筑区',
+            '独立建筑', '农业大棚', '机场', '尾矿库', '露天采矿场',
+            '露天采石场', '建筑工地', '墓地', '不透水面', '道路',
+            '铁路', '桥梁', '广场', '体育场', '水域',
+            '大坝（可发电）', '大坝（不可发电）', '沙漠', '裸地', '冰川', '云', '停车场', '光伏板'
+        ]
+      ignore_bg: false
+      palette:  [
+          [0, 0, 0], [1, 1, 1], [2, 2, 2], [3, 3, 3], [4, 4, 4], [5, 5, 5], [6, 6, 6], [7, 7, 7],[8, 8, 8], [9, 9, 9], [10, 10, 10], [11, 11, 11], [12, 12, 12], [13, 13, 13], [14, 14, 14], [15, 15, 15], [16, 16, 16], [17, 17, 17], [18, 18, 18], [19, 19, 19],
+                      [20, 20, 20], [21, 21, 21], [22, 22, 22], [23, 23, 23], [24, 24, 24], [25, 25, 25], [26, 26, 26], [27, 27, 27], [28, 28, 28], [29, 29, 29], [30, 30, 30], [31, 31, 31], [32, 32, 32]
+        ]
+
+      root_path_1: /mnt/fanfq/data/fan/data/dataset/merge_data_1116/val_test/images
+      root_path_2: /mnt/fanfq/data/fan/data/dataset/merge_data_1116/val_test/images
+      cache: none
+      split_key: test
+  wrapper:
+    name: test
+    args:
+      inp_size: 512
+  batch_size: 1
+
+eval_type: seg
+sam_checkpoint: 
+data_norm:
+  inp:
+    sub:
+    - 0.5
+    div:
+    - 0.5
+  gt:
+    sub:
+    - 0.5
+    div:
+    - 0.5
+  gt_rgb:
+    sub:
+    - 0.5
+    div:
+    - 0.5
+
+model:
+  name: sam_dinov3_10b_moe
+  args:
+    num_classes: 33
+    inp_size: 512
+    loss: iou
+    loss_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    encoder_mode:
+      name: dinov3_moe
+      prompt_embed_dim: 256
+      patch_size: 16
+    # MoE特定参数
+    num_experts: 8      # 专家数量
+    k: 2                 # 每次激活的专家数
+    moe_layers: [25,27,29,31,33,35,37,39]     # None表示使用后半部分层，或指定具体层索引如[16,17,18,19,20,21,22,23]
+    expert_capacity_factor: 1.5  # 专家容量扩展因子
+
+optimizer:
+  name: adamw 
+  args:
+    lr: 0.0002  # 降低学习率以适应更大的模型
+    weight_decay: 0.05
+
+lr_min: 1.0e-7
+epoch_max: 15  # 减少训练轮数
+
+multi_step_lr:
+  milestones:
+  - 1
+  gamma: 0.1
+
+epoch_val: 1
+epoch_save: 1
+
+# MoE相关设置
+moe_aux_loss_weight: 0.01  # MoE辅助损失权重
+gradient_clip_val: 1.0     # 梯度裁剪，对MoE模型很重要

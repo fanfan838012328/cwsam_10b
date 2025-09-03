@@ -143,8 +143,8 @@ class TwoWayAttentionBlock(nn.Module):
             embedding_dim=embedding_dim, 
             mlp_dim=mlp_dim,
             act=activation,
-            num_experts=16,
-            k=2,
+            num_experts=32,
+            k=4,
             noisy_gating=True
         )
         self.norm3 = nn.LayerNorm(embedding_dim)

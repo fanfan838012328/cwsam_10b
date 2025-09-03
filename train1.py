@@ -857,13 +857,13 @@ def train(train_loader, model, scheduler, scaler):
             total_grad_norm_tensor = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             total_grad_norm = total_grad_norm_tensor.item()
 
-            # 如果梯度范数异常大，额外警告 (动态调整阈值)
-            warning_threshold = max(max_grad_norm * 20, 5.0)  # 更合理的警告阈值
-            if torch.isinf(total_grad_norm_tensor) or torch.isnan(total_grad_norm_tensor) or total_grad_norm > warning_threshold:
+            # 只在梯度范数真正异常时才警告（减少日志噪音）
+            if torch.isinf(total_grad_norm_tensor) or torch.isnan(total_grad_norm_tensor):
                 if local_rank == 0:
-                    log(
-                        f"警告: batch {batch_idx} 梯度范数较大或异常: {total_grad_norm:.4f}, 当前缩放因子: {scaler.get_scale()}"
-                    )
+                    log(f"严重警告: batch {batch_idx} 梯度包含 NaN/Inf，已跳过更新")
+            elif total_grad_norm > max_grad_norm * 50:  # 只在极端情况下警告
+                if local_rank == 0 and batch_idx % 100 == 0:  # 每100个batch最多警告一次
+                    log(f"梯度范数较大: {total_grad_norm:.2f} (阈值: {max_grad_norm})")
 
             # scaler.step() 会自动检查梯度是否为NaN/Inf，并决定是否更新
             scaler.step(model.optimizer)
@@ -981,6 +981,18 @@ def main(config_, save_path, args):
                 for p in lin.parameters():
                     p.requires_grad = True
 
+    # 启用MoE参数（如果模型使用了MoE）
+    if hasattr(model, 'image_encoder'):
+        # 检查是否是MoE模型
+        if hasattr(model.image_encoder, 'moe_modules') and hasattr(model.image_encoder, 'get_moe_parameters'):
+            print("检测到MoE模型，启用MoE专家参数...")
+            moe_params = model.image_encoder.get_moe_parameters()
+            for param in moe_params:
+                param.requires_grad = True
+            
+            trainable_moe_params = sum(p.numel() for p in moe_params if p.requires_grad)
+            print(f"已启用 {trainable_moe_params/1e6:.1f}M MoE参数进行训练")
+    
     # 启用 projection 和 解码头
     for name, p in model.named_parameters():
         if (
