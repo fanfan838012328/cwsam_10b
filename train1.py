@@ -446,7 +446,6 @@ def eval_psnr(loader, model, config):
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(device)
-
             inp = batch['inp']
 
             with torch.no_grad():
@@ -701,7 +700,10 @@ def prepare_training(save_path):
         if local_rank == 0:
             log(f'恢复训练，加载 checkpoint: {resume_model_path}')
             
-        model = models.make(config['model']).cuda()
+        model_config = config['model'].copy()
+        if 'lora_l2_weight' in config:
+            model_config['args']['lora_l2_weight'] = config['lora_l2_weight']
+        model = models.make(model_config).cuda()
         print_memory_usage("模型直接在GPU上创建后")
         
         success = load_checkpoint_optimized(model, resume_model_path, local_rank)
@@ -719,7 +721,10 @@ def prepare_training(save_path):
             
     # 场景2: 开始新训练，但从指定checkpoint加载权重 (学习率从头开始)
     elif config.get('sam_checkpoint') is not None:
-        model = models.make(config['model']).cuda()
+        model_config = config['model'].copy()
+        if 'lora_l2_weight' in config:
+            model_config['args']['lora_l2_weight'] = config['lora_l2_weight']
+        model = models.make(model_config).cuda()
         print_memory_usage("新模型直接在GPU上创建后")
         
         checkpoint_path = config.get('sam_checkpoint')
@@ -762,7 +767,10 @@ def prepare_training(save_path):
     # 场景3: 完全从头开始训练
     else:
         # 不恢复训练的情况，直接在GPU上创建模型
-        model = models.make(config['model']).cuda()
+        model_config = config['model'].copy()
+        if 'lora_l2_weight' in config:
+            model_config['args']['lora_l2_weight'] = config['lora_l2_weight']
+        model = models.make(model_config).cuda()
         print_memory_usage("新模型直接在GPU上创建后")
     
     # 将模型设置为channels_last内存格式以提高性能
@@ -785,6 +793,37 @@ def prepare_training(save_path):
     return model.module, epoch_start
 
 
+def lora_l2_loss(model, alpha=0.001):
+    """计算LoRA权重的L2正则化损失"""
+    l2_loss = 0
+    for name, param in model.named_parameters():
+        if 'lora' in name.lower() and 'linear_a' in name:
+            l2_loss += torch.norm(param, p=2)
+    return alpha * l2_loss
+
+
+def apply_warmup_lr(optimizer, epoch, config):
+    """应用学习率warmup策略"""
+    if 'warmup_epochs' not in config:
+        return None
+        
+    warmup_epochs = config['warmup_epochs']
+    warmup_factor = config.get('warmup_factor', 0.1)
+    
+    if epoch < warmup_epochs:
+        base_lr = config['optimizer']['args']['lr']
+        progress = (epoch + 1) / warmup_epochs
+        current_lr = base_lr * (warmup_factor + (1 - warmup_factor) * progress)
+        
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_lr
+            
+        if local_rank == 0:
+            log(f"Warmup epoch {epoch+1}/{warmup_epochs}, LR: {current_lr:.6f}")
+        return current_lr
+    return None
+
+
 def train(train_loader, model, scheduler, scaler):
     model.train()
 
@@ -795,11 +834,13 @@ def train(train_loader, model, scheduler, scaler):
 
     loss_list = []
     nan_count = 0
-    # 根据是否从检查点开始训练，使用不同的梯度裁剪策略
-    if config.get('sam_checkpoint') is not None:
-        max_grad_norm = 0.01  # 检查点训练使用更严格的梯度裁剪
+    # 动态调整梯度裁剪，支持高维LoRA
+    if 'gradient_clip_val' in config:
+        max_grad_norm = config['gradient_clip_val']
+    elif config.get('sam_checkpoint') is not None:
+        max_grad_norm = 5.0  # 检查点训练也使用更宽松的梯度裁剪
     else:
-        max_grad_norm = 0.1   # 从头训练使用标准梯度裁剪
+        max_grad_norm = 5.0   # 从头训练使用更宽松的梯度裁剪
     
     for batch_idx, batch in enumerate(train_loader):
         for k, v in batch.items():
@@ -1083,6 +1124,9 @@ def main(config_, save_path, args):
     for epoch in range(epoch_start, epoch_max + 1):
         train_loader.sampler.set_epoch(epoch)
         t_epoch_start = timer.t()
+        
+        # 应用warmup策略
+        warmup_lr = apply_warmup_lr(optimizer, epoch, config)
         
         # 在训练前检查学习率 (OneCycleLR 自动处理预热和调度)
         # check_and_adjust_learning_rate(optimizer, epoch, loss_history)

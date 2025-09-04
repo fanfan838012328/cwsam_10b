@@ -434,9 +434,11 @@ class SAM_MOE_3B(nn.Module):
         loss_weight=None,
         ignore_index=-100,
         resume=None,
+        lora_l2_weight=0.001,  # 添加LoRA L2正则化权重参数
     ):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.lora_l2_weight = lora_l2_weight  # 保存LoRA L2正则化权重
         # User needs to download the weights from https://ai.meta.com/resources/models-and-libraries/dinov3-downloads/
         # and provide the local path here.
         weights_path = '/mnt/fanfq/data/fan/weights/dinov3_vit7b16_pretrain_sat493m-a6675841.pth'
@@ -671,23 +673,19 @@ class SAM_MOE_3B(nn.Module):
         """Calculate GAN and L1 loss for the generator"""
         # mask = self.create_ignore_mask(self.gt_mask, ignore_index=self.ignore_index)
 
-        loss = self.criterionBCE(
+        main_loss = self.criterionBCE(
             self.pred_mask, torch.argmax(self.gt_mask, dim=1, keepdim=True).squeeze(1)
         )  # (1,4,1024,1024)
-        # print(
-        #     f'未忽略类别loss:{self.criterionBCE(self.pred_mask, self.gt_mask).mean()}'
-        # )
-        # guanfang_crt = torch.nn.CrossEntropyLoss(ignore_index=0)
-        # guanfang_loss = guanfang_crt(
-        #     self.pred_mask, torch.argmax(self.gt_mask, dim=1, keepdim=True).squeeze(1)
-        # )
-        # print(f'guanfang忽略类别loss:{guanfang_loss}')
-        # loss = self.get_ignore_mask_loss(loss, ignore_index=self.ignore_index)
-        # print(f'忽略类别loss:{loss}')
-
-        # loss = loss * mask  # 应用掩码
-        # loss = loss.sum() / mask.sum()  # 仅计算非忽略像素的损失
-        self.loss_G = loss
+        
+        # 添加LoRA L2正则化
+        lora_l2_loss = 0
+        if hasattr(self, 'lora_l2_weight') and self.lora_l2_weight > 0:
+            for name, param in self.named_parameters():
+                if 'lora' in name.lower() and 'linear_a' in name:
+                    lora_l2_loss += torch.norm(param, p=2)
+            lora_l2_loss = self.lora_l2_weight * lora_l2_loss
+        
+        self.loss_G = main_loss + lora_l2_loss
         # if self.loss_mode == 'iou':
         # self.loss_G += _iou_loss(self.pred_mask, self.gt_mask)
 
