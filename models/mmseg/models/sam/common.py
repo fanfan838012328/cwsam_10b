@@ -130,78 +130,7 @@ class Adapter(nn.Module):
             x = xs
         return x
 
-# class LayerNorm2d1(nn.Module):
-#     def __init__(self, num_channels: int, eps: float = 1e-6) -> None:
-#         super().__init__()
-#         self.weight = nn.Parameter(torch.ones(num_channels))
-#         self.bias = nn.Parameter(torch.zeros(num_channels))
-#         self.eps = eps
 
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         # 确保输入张量的通道数与权重和偏置的维度匹配
-#         u = x.mean(1, keepdim=True)
-#         s = (x - u).pow(2).mean(1, keepdim=True)
-#         x = (x - u) / torch.sqrt(s + self.eps)
-#         # 确保权重和偏置的维度正确扩展
-#         x = self.weight.view(1, -1, 1, 1) * x + self.bias.view(1, -1, 1, 1)
-#         return x
-# class Adapter(nn.Module):
-#     def __init__(
-#         self, 
-#         D_features,  # 输入特征维度
-#         mlp_ratio=0.5,  # 进一步降低比例以节省显存
-#         act_layer=nn.GELU, 
-#         skip_connect=True,
-#         dropout=0.1,
-#         layer_norm=True,
-#         num_layers=2
-#     ):
-#         super().__init__()
-#         self.skip_connect = skip_connect
-#         self.D_features = D_features
-        
-#         # 主干MLP层
-#         hidden_dim = int(D_features * mlp_ratio)
-        
-#         self.norm1 = LayerNorm2d1(D_features) if layer_norm else nn.Identity()
-#         self.conv1 = nn.Conv2d(D_features, hidden_dim, 1)
-#         self.act = act_layer()
-#         self.dropout1 = nn.Dropout(dropout)
-#         self.conv2 = nn.Conv2d(hidden_dim, D_features, 1)
-#         self.norm2 = LayerNorm2d1(D_features) if layer_norm else nn.Identity()
-        
-#         self._init_weights()
-    
-#     def _init_weights(self):
-#         for m in self.modules():
-#             if isinstance(m, nn.Conv2d):
-#                 nn.init.kaiming_normal_(m.weight)
-#                 if m.bias is not None:
-#                     nn.init.zeros_(m.bias)
-    
-#     def forward(self, x):
-#         # 输入 x 形状: [B, H, W, C]
-#         # 转换为通道优先格式
-#         x = x.permute(0, 3, 1, 2)
-        
-#         # 保存输入用于残差连接
-#         identity = x
-        
-#         # 主干前向传播
-#         x = self.norm1(x)
-#         x = self.conv1(x)
-#         x = self.act(x)
-#         x = self.dropout1(x)
-#         x = self.conv2(x)
-#         x = self.norm2(x)
-        
-#         # 残差连接
-#         if self.skip_connect:
-#             x = x + identity
-            
-#         # 转回原始维度顺序 [B, C, H, W] -> [B, H, W, C]
-#         x = x.permute(0, 2, 3, 1)
-#         return x 
 class MLPBlock(nn.Module):
     def __init__(
         self,

@@ -834,13 +834,9 @@ def train(train_loader, model, scheduler, scaler):
 
     loss_list = []
     nan_count = 0
-    # 动态调整梯度裁剪，支持高维LoRA
-    if 'gradient_clip_val' in config:
-        max_grad_norm = config['gradient_clip_val']
-    elif config.get('sam_checkpoint') is not None:
-        max_grad_norm = 5.0  # 检查点训练也使用更宽松的梯度裁剪
-    else:
-        max_grad_norm = 5.0   # 从头训练使用更宽松的梯度裁剪
+    # 关闭梯度裁剪，让模型自由更新参数
+    # 使用bfloat16和更低学习率来保证数值稳定性
+    max_grad_norm = None  # 不再使用梯度裁剪
     
     for batch_idx, batch in enumerate(train_loader):
         for k, v in batch.items():
@@ -861,9 +857,9 @@ def train(train_loader, model, scheduler, scaler):
             # 单任务模式，向后兼容
             model.set_input(inp, gt)
         
-        # 改用fp16而不是bfloat16以提高数值稳定性
+        # 改用bfloat16以提高数值稳定性，特别适合大参数模型
         try:
-            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
                 # 手动执行优化步骤以增加控制
                 model.forward()
                 model.optimizer.zero_grad(set_to_none=True) # 使用 set_to_none=True 进一步优化内存
@@ -894,17 +890,17 @@ def train(train_loader, model, scheduler, scaler):
             # 在梯度裁剪前取消缩放
             scaler.unscale_(model.optimizer)
             
-            # 梯度裁剪防止梯度爆炸，并获取梯度范数
-            total_grad_norm_tensor = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            # 关闭梯度裁剪，只计算梯度范数用于监控
+            total_grad_norm_tensor = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in model.parameters() if p.grad is not None]))
             total_grad_norm = total_grad_norm_tensor.item()
 
             # 只在梯度范数真正异常时才警告（减少日志噪音）
             if torch.isinf(total_grad_norm_tensor) or torch.isnan(total_grad_norm_tensor):
                 if local_rank == 0:
                     log(f"严重警告: batch {batch_idx} 梯度包含 NaN/Inf，已跳过更新")
-            elif total_grad_norm > max_grad_norm * 50:  # 只在极端情况下警告
+            elif total_grad_norm > 10.0:  # 监控大梯度但不裁剪
                 if local_rank == 0 and batch_idx % 100 == 0:  # 每100个batch最多警告一次
-                    log(f"梯度范数较大: {total_grad_norm:.2f} (阈值: {max_grad_norm})")
+                    log(f"梯度范数较大: {total_grad_norm:.2f} (仅监控，不裁剪)")
 
             # scaler.step() 会自动检查梯度是否为NaN/Inf，并决定是否更新
             scaler.step(model.optimizer)
@@ -916,7 +912,9 @@ def train(train_loader, model, scheduler, scaler):
                 
         except Exception as e:
             if local_rank == 0:
+                import traceback
                 log(f"训练异常 batch {batch_idx}: {e}")
+                log(traceback.format_exc())
             cleanup_memory() # 出现异常时清理内存
             continue
         
@@ -948,6 +946,11 @@ def train(train_loader, model, scheduler, scaler):
     # 统计信息
     if local_rank == 0 and nan_count > 0:
         log(f"训练完成，总共跳过 {nan_count} 个NaN/Inf batch")
+
+    if not loss_list:
+        if local_rank == 0:
+            log("警告: 整个 epoch 中没有任何一个 batch 成功计算损失，返回 NaN。")
+        return float('nan')
 
     loss = [i.item() for i in loss_list]
     return mean(loss)
@@ -1042,6 +1045,7 @@ def main(config_, save_path, args):
             or '.mask_decoders.' in name
             or name.startswith('no_mask_embed')
             or name.startswith('pe_layer')
+            or 'adapter' in name
         ):
             p.requires_grad = True
 

@@ -21,7 +21,7 @@ from .mmseg.models.sam import (
     TwoWayTransformer_moe
 
 )
-from .mmseg.models.sam.common import LayerNorm2d
+from .mmseg.models.sam.common import LayerNorm2d, Adapter
 from .dinov3_lora import DINOV3EncoderLoRA
 from .dinov3_moe import create_dinov3_10b_moe
 
@@ -992,20 +992,417 @@ class SAM_DINOV3_10B_MoE(nn.Module):
     
     def get_parameter_stats(self):
         """获取参数统计信息"""
-        return self.image_encoder.get_parameter_count()
+class DINOV3EncoderAdapter(nn.Module):
+    """DINOv3 with Adapter-based fine-tuning"""
     
-    def get_moe_parameters(self):
-        """获取MoE参数用于优化器设置"""
-        moe_params = self.image_encoder.get_moe_parameters()
+    def __init__(
+        self,
+        encoder,
+        adapter_mlp_ratio: float = 0.25,
+        adapter_layers: Optional[list] = None,
+    ):
+        """DINOv3 encoder with adapter layers for fine-tuning.
+        
+        Args:
+            encoder (nn.Module): The ViT encoder model loaded with DINOv3 weights.
+            adapter_mlp_ratio (float): The ratio for adapter hidden dimension.
+            adapter_layers (Optional[list]): List of encoder block layers to apply adapters.
+                                           Defaults to None, which applies to all layers.
+        """
+        super().__init__()
+        
+        self.encoder = encoder
+        
+        # 确定要添加adapter的层
+        if adapter_layers is None:
+            self.adapter_layers = list(range(len(self.encoder.blocks)))
+        else:
+            self.adapter_layers = adapter_layers
+        
+        # 为指定的transformer block添加adapter
+        self.adapters = nn.ModuleList()
+        for i, block in enumerate(self.encoder.blocks):
+            if i in self.adapter_layers:
+                # 获取block的隐藏维度
+                hidden_dim = block.norm1.normalized_shape[0]  # 通过norm层获取正确维度
+                
+                # 创建adapter
+                adapter = Adapter(
+                    D_features=hidden_dim,
+                    mlp_ratio=adapter_mlp_ratio,
+                    skip_connect=True
+                )
+                self.adapters.append(adapter)
+                
+                # 替换block的forward方法
+                self._wrap_block_with_adapter(block, adapter)
+            else:
+                self.adapters.append(None)
+        
+        # 冻结原始encoder参数，但要在添加adapter之后
+        self._freeze_encoder_except_adapters()
+        
+        print(f"添加了 {len([a for a in self.adapters if a is not None])} 个adapter层")
+    
+    def _freeze_encoder_except_adapters(self):
+        """冻结encoder参数，但保持adapter可训练"""
+        # 先冻结所有encoder参数
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        
+        # 然后设置adapter参数为可训练
+        adapter_count = 0
+        for adapter in self.adapters:
+            if adapter is not None:
+                for param in adapter.parameters():
+                    param.requires_grad = True
+                    adapter_count += 1
+        
+        print(f"冻结了encoder参数，设置了 {adapter_count} 个adapter参数为可训练")
+    
+    def _wrap_block_with_adapter(self, block, adapter):
+        """用adapter包装transformer block的forward方法"""
+        original_forward = block.forward
+        
+        def forward_with_adapter(*args, **kwargs):
+            # 调用原始forward
+            output = original_forward(*args, **kwargs)
+            
+            # DINOv3 block可以返回单个Tensor或Tensor列表。
+            # 必须处理这两种情况并保留返回类型以避免破坏后续块的输入。
+            if isinstance(output, torch.Tensor):
+                # 如果输出是单个Tensor，应用adapter并返回Tensor。
+                return adapter(output)
+            elif isinstance(output, list):
+                # 如果输出是列表，对列表中的每个Tensor应用adapter并返回新的列表。
+                return [adapter(x) for x in output]
+            
+            # 对于任何其他意外的返回类型，直接返回以避免进一步的错误。
+            return output
+        
+        # 替换forward方法
+        block.forward = forward_with_adapter
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """前向传播，代理到底层encoder"""
+        return self.encoder(x)
+
+    def forward_features(self, x: torch.Tensor):
+        """代理到底层encoder的forward_features以保持兼容性"""
+        return self.encoder.forward_features(x)
+
+
+@register('sam_dinov3_adapter')
+class SAM_DINOV3_Adapter(nn.Module):
+    """SAM with DINOv3 backbone and Adapter-based fine-tuning"""
+    
+    def __init__(
+        self,
+        inp_size=None,
+        encoder_mode=None,
+        loss=None,
+        num_classes=None,
+        loss_weight=None,
+        ignore_index=-100,
+        resume=None,
+        # Adapter specific parameters
+        adapter_mlp_ratio=0.25,
+        adapter_layers=None,  # 指定哪些层添加adapter，None表示所有层
+    ):
+        super().__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # DINOv3权重路径
+        dinov3_weights_path = '/mnt/fanfq/data/fan/weights/dinov3_vit7b16_pretrain_sat493m-a6675841.pth'
+        
+        # 初始化DINOv3模型
+        if resume is None:
+            # 新训练时加载预训练权重
+            base_encoder = torch.hub.load('dinov3-main', 'dinov3_vit7b16', source='local', weights=dinov3_weights_path)
+        else:
+            # 恢复训练时只构建模型结构
+            base_encoder = torch.hub.load('dinov3-main', 'dinov3_vit7b16', source='local', pretrained=False)
+        
+        # 用Adapter包装DINOv3编码器
+        self.image_encoder = DINOV3EncoderAdapter(
+            encoder=base_encoder,
+            adapter_mlp_ratio=adapter_mlp_ratio,
+            adapter_layers=adapter_layers
+        )
+        
+        # DINOv3输出维度
+        dinov3_hidden_dim = 4096  # DINOv3-7B的实际隐藏维度
+        
+        # 投影层：DINOv3特征 -> SAM prompt特征
+        mid_dim = 512
+        self.projection = nn.Sequential(
+            nn.Conv2d(dinov3_hidden_dim, mid_dim, kernel_size=1, bias=False),
+            LayerNorm2d(mid_dim),
+            nn.Conv2d(mid_dim, encoder_mode['prompt_embed_dim'], kernel_size=3, padding=1, bias=False),
+            LayerNorm2d(encoder_mode['prompt_embed_dim']),
+        )
+        
+        self.prompt_embed_dim = encoder_mode['prompt_embed_dim']
+        
+        # SAM解码器
+        self.mask_decoder = MaskDecoder(
+            num_multimask_outputs=3,
+            transformer=TwoWayTransformer(
+                depth=2,
+                embedding_dim=self.prompt_embed_dim,
+                mlp_dim=2048,
+                num_heads=8,
+            ),
+            transformer_dim=self.prompt_embed_dim,
+            iou_head_depth=3,
+            iou_head_hidden_dim=256,
+            num_classes=num_classes,
+        )
+        
+        # 损失函数设置
+        self.loss_mode = loss
+        self.ignore_index = ignore_index
+        
+        if self.loss_mode == 'bce':
+            self.criterionBCE = torch.nn.BCEWithLogitsLoss(reduction='none')
+        elif self.loss_mode == 'bbce':
+            self.criterionBCE = BBCEWithLogitLoss()
+        elif self.loss_mode == 'iou':
+            if loss_weight is not None:
+                pos_weight = torch.tensor(loss_weight, dtype=torch.float)
+                self.criterionBCE = torch.nn.CrossEntropyLoss(
+                    weight=pos_weight, ignore_index=self.ignore_index
+                )
+            else:
+                self.criterionBCE = torch.nn.CrossEntropyLoss(
+                    ignore_index=self.ignore_index
+                )
+            self.criterionIOU = IOU()
+        
+        # 位置编码
+        self.pe_layer = PositionEmbeddingRandom(encoder_mode['prompt_embed_dim'] // 2)
+        self.inp_size = inp_size
+        self.image_embedding_size = inp_size // encoder_mode['patch_size']
+        self.no_mask_embed = nn.Embedding(1, encoder_mode['prompt_embed_dim'])
+        
+        # 打印参数统计信息（调试用）
+        self.print_trainable_parameters()
+    
+    def print_trainable_parameters(self):
+        """打印可训练参数统计"""
+        trainable_params = 0
+        all_param = 0
+        adapter_params = 0
+        
+        # 首先强制确保adapter参数可训练
+        for name, param in self.named_parameters():
+            if 'adapter' in name:
+                param.requires_grad = True
+        
+        # 然后统计参数
+        for name, param in self.named_parameters():
+            all_param += param.numel()
+            if param.requires_grad:
+                trainable_params += param.numel()
+                if 'adapter' in name:
+                    adapter_params += param.numel()
+                print(f"可训练参数: {name} - {param.shape}")
+        
+        print(f"总参数: {all_param}")
+        print(f"可训练参数: {trainable_params}")
+        print(f"Adapter参数: {adapter_params}")
+        print(f"可训练比例: {100 * trainable_params / all_param:.2f}%")
+    
+    def ensure_adapters_trainable(self):
+        """确保所有adapter参数都是可训练的"""
+        adapter_count = 0
+        for name, param in self.named_parameters():
+            if 'adapter' in name:
+                param.requires_grad = True
+                adapter_count += 1
+        print(f"强制设置了 {adapter_count} 个adapter参数为可训练")
+        return adapter_count
+    
+    def set_input(self, input, gt_mask, task_ids=None):
+        self.input = input.to(self.device)
+        self.gt_mask = gt_mask.to(self.device)
+    
+    def get_dense_pe(self) -> torch.Tensor:
+        """获取位置编码"""
+        return self.pe_layer(self.image_embedding_size).unsqueeze(0)
+    
+    def forward(self):
+        bs = self.input.shape[0]
+        
+        # DINOv3特征提取（adapter已经内置在image_encoder中）
+        dino_output = self.image_encoder.forward_features(self.input)
+        
+        # 处理DINOv3输出格式
+        if isinstance(dino_output, dict):
+            if 'x_norm_patchtokens' in dino_output:
+                dino_features = dino_output['x_norm_patchtokens']
+            elif 'x_prenorm' in dino_output:
+                dino_features = dino_output['x_prenorm'][:, 1:]  # 去掉CLS token
+            else:
+                dino_features = list(dino_output.values())[0]
+                if dino_features.dim() == 3:
+                    dino_features = dino_features[:, 1:]  # 去掉CLS token
+        else:
+            if dino_output.dim() == 3:
+                dino_features = dino_output[:, 1:]  # 去掉CLS token
+            else:
+                dino_features = dino_output
+        
+        # 推导网格尺寸
+        token_count = dino_features.shape[1]
+        h = int(math.sqrt(token_count))
+        if h * h != token_count:
+            h = int(round(token_count ** 0.5))
+        if h * h != token_count:
+            raise RuntimeError(f"意外的token数量={token_count}，无法形成方形网格")
+        w = h
+        
+        # 重塑为空间维度：(B, N, D) -> (B, D, H, W)
+        dino_features = dino_features.permute(0, 2, 1).reshape(bs, -1, h, w)
+        
+        # 投影到SAM特征空间
+        self.features = self.projection(dino_features)
+        
+        # SAM mask解码
+        sparse_embeddings = torch.empty(
+            (bs, 0, self.prompt_embed_dim), device=self.input.device
+        )
+        
+        low_res_masks, iou_predictions = self.mask_decoder(
+            image_embeddings=self.features,
+            image_pe=self.pe_layer(h).unsqueeze(0),
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+                bs, -1, h, w
+            ),
+            multimask_output=False,
+        )
+        
+        # 选择第一个mask token的输出
+        low_res_masks = low_res_masks[:, 0]  # (bs, num_classes, h, w)
+        
+        # 上采样到原始分辨率
+        masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
+        self.pred_mask = masks
+    
+    def infer(self, input, task_id=None):
+        """推理接口"""
+        bs = input.shape[0]
+        
+        # DINOv3特征提取（adapter已经内置）
+        dino_output = self.image_encoder.forward_features(input)
+        
+        # 处理输出格式（同forward）
+        if isinstance(dino_output, dict):
+            if 'x_norm_patchtokens' in dino_output:
+                dino_features = dino_output['x_norm_patchtokens']
+            elif 'x_prenorm' in dino_output:
+                dino_features = dino_output['x_prenorm'][:, 1:]
+            else:
+                dino_features = list(dino_output.values())[0]
+                if dino_features.dim() == 3:
+                    dino_features = dino_features[:, 1:]
+        else:
+            if dino_output.dim() == 3:
+                dino_features = dino_output[:, 1:]
+            else:
+                dino_features = dino_output
+        
+        # 网格重塑
+        token_count = dino_features.shape[1]
+        h = int(math.sqrt(token_count))
+        if h * h != token_count:
+            h = int(round(token_count ** 0.5))
+        w = h
+        
+        dino_features = dino_features.permute(0, 2, 1).reshape(bs, -1, h, w)
+        features = self.projection(dino_features)
+        
+        # SAM解码
+        sparse_embeddings = torch.empty(
+            (bs, 0, self.prompt_embed_dim), device=input.device
+        )
+        
+        low_res_masks, _ = self.mask_decoder(
+            image_embeddings=features,
+            image_pe=self.pe_layer(h).unsqueeze(0),
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+                bs, -1, h, w
+            ),
+            multimask_output=False,
+        )
+        
+        low_res_masks = low_res_masks[:, 0]
+        masks = self.postprocess_masks(low_res_masks, self.inp_size, self.inp_size)
+        return masks
+    
+    def postprocess_masks(
+        self,
+        masks: torch.Tensor,
+        input_size: Tuple[int, ...],
+        original_size: Tuple[int, ...],
+    ) -> torch.Tensor:
+        """后处理masks"""
+        masks = masks.squeeze(dim=1)
+        masks = F.interpolate(
+            masks,
+            (self.inp_size, self.inp_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        masks = masks[..., :input_size, :input_size]
+        masks = F.interpolate(
+            masks, original_size, mode="bilinear", align_corners=False
+        )
+        return masks
+    
+    def backward_G(self):
+        """计算损失"""
+        # 主任务损失
+        main_loss = self.criterionBCE(
+            self.pred_mask, torch.argmax(self.gt_mask, dim=1, keepdim=True).squeeze(1)
+        )
+        
+        self.loss_G = main_loss
+    
+    def optimize_parameters(self):
+        """优化参数"""
+        self.forward()
+        self.optimizer.zero_grad()
+        self.backward_G()
+        self.optimizer.step()
+    
+    def set_requires_grad(self, nets, requires_grad=False):
+        """设置梯度需求"""
+        if not isinstance(nets, list):
+            nets = [nets]
+        for net in nets:
+            if net is not None:
+                for param in net.parameters():
+                    param.requires_grad = requires_grad
+    
+    def get_adapter_parameters(self):
+        """获取adapter参数用于优化器设置"""
+        adapter_params = []
+        for name, param in self.image_encoder.named_parameters():
+            if 'adapter' in name and param.requires_grad:
+                adapter_params.append(param)
+        
         projection_params = list(self.projection.parameters())
         decoder_params = list(self.mask_decoder.parameters())
         other_params = list(self.pe_layer.parameters()) + list(self.no_mask_embed.parameters())
         
         return {
-            'moe_params': moe_params,
+            'adapter_params': adapter_params,
             'projection_params': projection_params,
             'decoder_params': decoder_params,
             'other_params': other_params,
-            'trainable_params': moe_params + projection_params + decoder_params + other_params
+            'trainable_params': adapter_params + projection_params + decoder_params + other_params
         }
 

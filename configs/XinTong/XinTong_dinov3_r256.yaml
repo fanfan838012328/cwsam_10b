@@ -140,8 +140,8 @@ model:
 optimizer:
   name: adamw 
   args:
-    lr: 0.0004
-    weight_decay: 0.01  # 降低weight decay以减少正则化压力
+    lr: 0.0001  # 进一步降低到5e-5 (从0.0004降低8倍)
+    weight_decay: 0.0002  # 降低weight_decay，减少正则化压力
 lr_min: 1.0e-7
 epoch_max: 20
 # 延后学习率衰减，给模型更多时间稳定
@@ -153,14 +153,14 @@ multi_step_lr:
   gamma: 0.5  # 更温和的衰减率，从0.1改为0.5
 
 # 添加warmup设置
-warmup_epochs: 5  # 前5个epoch进行warmup
-warmup_factor: 0.1  # warmup起始因子
+warmup_epochs: 6  # 延长warmup到6个epoch，给更多时间适应
+warmup_factor: 0.05  # 更保守的warmup起始因子
 
-# 梯度裁剪设置（将在train1.py中使用）
-gradient_clip_val: 5.0  # 大幅提升梯度裁剪阈值
+# 梯度裁剪设置（已关闭，使用bfloat16+低学习率保证稳定性）
+# gradient_clip_val: 关闭梯度裁剪
 
 # LoRA正则化权重
-lora_l2_weight: 0.001  # LoRA L2正则化权重
+lora_l2_weight: 0.01  # 提高正则化权重
 epoch_val: 1
 epoch_save: 1
 # resume: 8 # 这是一个新的微调阶段，不再需要resume
